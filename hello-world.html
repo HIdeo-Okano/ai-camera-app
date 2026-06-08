@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Hello World</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      font-family: -apple-system, 'Helvetica Neue', Arial, sans-serif;
+      background: #000;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    /* iPhoneフレーム */
+    .iphone-frame {
+      width: 390px;
+      height: 844px;
+      background: #1c1c1e;
+      border-radius: 55px;
+      border: 8px solid #3a3a3c;
+      box-shadow:
+        0 0 0 1px #555,
+        0 30px 80px rgba(0,0,0,0.9),
+        inset 0 0 0 2px #2c2c2e;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ダイナミックアイランド */
+    .dynamic-island {
+      width: 126px;
+      height: 37px;
+      background: #000;
+      border-radius: 20px;
+      position: absolute;
+      top: 14px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+    }
+
+    /* ステータスバー */
+    .status-bar {
+      height: 59px;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      padding: 0 28px 10px;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+
+    .status-time {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+    }
+
+    .status-icons {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 14px;
+    }
+
+    /* ナビゲーションバー */
+    .nav-bar {
+      background: rgba(28, 28, 30, 0.92);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      padding: 12px 20px;
+      border-bottom: 0.5px solid rgba(255,255,255,0.1);
+      flex-shrink: 0;
+    }
+
+    .nav-title {
+      color: #fff;
+      font-size: 17px;
+      font-weight: 600;
+      text-align: center;
+      letter-spacing: -0.2px;
+    }
+
+    /* メインコンテンツ */
+    .content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(160deg, #0a0a1a 0%, #0d1b4b 40%, #1a0a3a 100%);
+      position: relative;
+      overflow: hidden;
+    }
+
+    /* 背景の星 */
+    .stars {
+      position: absolute;
+      inset: 0;
+    }
+
+    .star {
+      position: absolute;
+      width: 2px;
+      height: 2px;
+      background: #fff;
+      border-radius: 50%;
+      animation: twinkle var(--dur) ease-in-out infinite;
+      opacity: 0;
+    }
+
+    @keyframes twinkle {
+      0%, 100% { opacity: 0; }
+      50% { opacity: 0.8; }
+    }
+
+    /* Helloテキスト */
+    .hello-container {
+      position: relative;
+      z-index: 2;
+      text-align: center;
+      padding: 30px;
+    }
+
+    .hello-label {
+      color: rgba(255,255,255,0.5);
+      font-size: 14px;
+      font-weight: 500;
+      letter-spacing: 4px;
+      text-transform: uppercase;
+      margin-bottom: 16px;
+    }
+
+    .hello-text {
+      font-size: 56px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #fff 0%, #a78bfa 50%, #60a5fa 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: -2px;
+      line-height: 1.1;
+      animation: fadeInUp 0.8s ease forwards;
+    }
+
+    .world-text {
+      font-size: 56px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #f472b6 0%, #fb923c 50%, #facc15 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: -2px;
+      line-height: 1.1;
+      animation: fadeInUp 0.8s ease 0.2s forwards;
+      opacity: 0;
+    }
+
+    @keyframes fadeInUp {
+      from {
+        opacity: 0;
+        transform: translateY(20px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    /* 輝くリング */
+    .glow-ring {
+      width: 220px;
+      height: 220px;
+      border-radius: 50%;
+      border: 1px solid rgba(167, 139, 250, 0.3);
+      position: absolute;
+      animation: pulse-ring 3s ease-in-out infinite;
+    }
+
+    .glow-ring:nth-child(2) {
+      width: 280px;
+      height: 280px;
+      border-color: rgba(96, 165, 250, 0.2);
+      animation-delay: 0.5s;
+    }
+
+    .glow-ring:nth-child(3) {
+      width: 340px;
+      height: 340px;
+      border-color: rgba(244, 114, 182, 0.15);
+      animation-delay: 1s;
+    }
+
+    @keyframes pulse-ring {
+      0%, 100% { transform: scale(1); opacity: 0.6; }
+      50% { transform: scale(1.05); opacity: 1; }
+    }
+
+    .subtitle {
+      color: rgba(255,255,255,0.4);
+      font-size: 14px;
+      margin-top: 24px;
+      letter-spacing: 0.5px;
+      animation: fadeInUp 0.8s ease 0.4s forwards;
+      opacity: 0;
+    }
+
+    /* タップボタン */
+    .tap-button {
+      margin-top: 40px;
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 30px;
+      padding: 14px 36px;
+      color: #fff;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      transition: all 0.15s ease;
+      animation: fadeInUp 0.8s ease 0.6s forwards;
+      opacity: 0;
+      letter-spacing: -0.2px;
+    }
+
+    .tap-button:active {
+      transform: scale(0.96);
+      background: rgba(255,255,255,0.2);
+    }
+
+    /* ホームインジケーター */
+    .home-indicator {
+      height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #1c1c1e;
+      flex-shrink: 0;
+    }
+
+    .home-bar {
+      width: 134px;
+      height: 5px;
+      background: rgba(255,255,255,0.4);
+      border-radius: 3px;
+    }
+
+    /* モバイル直接表示時 */
+    @media (max-width: 430px) {
+      body {
+        background: linear-gradient(160deg, #0a0a1a 0%, #0d1b4b 40%, #1a0a3a 100%);
+      }
+
+      .iphone-frame {
+        width: 100vw;
+        height: 100vh;
+        border-radius: 0;
+        border: none;
+        box-shadow: none;
+      }
+
+      .dynamic-island {
+        display: none;
+      }
+
+      .status-bar {
+        height: 44px;
+        padding-bottom: 8px;
+      }
+    }
+
+    /* トースト通知 */
+    .toast {
+      position: absolute;
+      top: 80px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-20px);
+      background: rgba(50, 50, 52, 0.95);
+      color: #fff;
+      padding: 12px 20px;
+      border-radius: 14px;
+      font-size: 14px;
+      font-weight: 500;
+      white-space: nowrap;
+      opacity: 0;
+      transition: all 0.3s ease;
+      pointer-events: none;
+      z-index: 100;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+  </style>
+</head>
+<body>
+  <div class="iphone-frame">
+    <!-- ダイナミックアイランド -->
+    <div class="dynamic-island"></div>
+
+    <!-- ステータスバー -->
+    <div class="status-bar">
+      <span class="status-time" id="clock">9:41</span>
+      <div class="status-icons">
+        <svg width="17" height="12" viewBox="0 0 17 12" fill="white">
+          <rect x="0" y="3" width="3" height="9" rx="1"/>
+          <rect x="4.5" y="2" width="3" height="10" rx="1"/>
+          <rect x="9" y="1" width="3" height="11" rx="1"/>
+          <rect x="13.5" y="0" width="3" height="12" rx="1"/>
+        </svg>
+        <svg width="16" height="12" viewBox="0 0 16 12" fill="white">
+          <path d="M8 2.4C10.2 2.4 12.2 3.3 13.6 4.8L15.1 3.3C13.2 1.2 10.8 0 8 0 5.2 0 2.8 1.2 0.9 3.3L2.4 4.8C3.8 3.3 5.8 2.4 8 2.4Z"/>
+          <path d="M8 5.6C9.4 5.6 10.7 6.2 11.7 7.1L13.2 5.6C11.8 4.3 10 3.5 8 3.5 6 3.5 4.2 4.3 2.8 5.6L4.3 7.1C5.3 6.2 6.6 5.6 8 5.6Z"/>
+          <circle cx="8" cy="10.5" r="1.5"/>
+        </svg>
+        <svg width="25" height="12" viewBox="0 0 25 12" fill="white">
+          <rect x="0" y="1" width="22" height="10" rx="3" stroke="white" stroke-width="1" fill="none"/>
+          <rect x="1.5" y="2.5" width="17" height="7" rx="2" fill="white"/>
+          <path d="M23 4.5v3a1.5 1.5 0 000-3z"/>
+        </svg>
+      </div>
+    </div>
+
+    <!-- ナビゲーションバー -->
+    <div class="nav-bar">
+      <div class="nav-title">Hello World App</div>
+    </div>
+
+    <!-- メインコンテンツ -->
+    <div class="content">
+      <div class="stars" id="stars"></div>
+
+      <div class="glow-ring"></div>
+      <div class="glow-ring"></div>
+      <div class="glow-ring"></div>
+
+      <div class="hello-container">
+        <div class="hello-label">Welcome to iPhone</div>
+        <div class="hello-text">Hello,</div>
+        <div class="world-text">World!</div>
+        <div class="subtitle">iPhone上でHello Worldを表示しています</div>
+        <button class="tap-button" onclick="onTap()">タップしてみて！</button>
+      </div>
+
+      <div class="toast" id="toast">こんにちは、世界！🎉</div>
+    </div>
+
+    <!-- ホームインジケーター -->
+    <div class="home-indicator">
+      <div class="home-bar"></div>
+    </div>
+  </div>
+
+  <script>
+    // 時計の更新
+    function updateClock() {
+      const now = new Date();
+      const h = now.getHours().toString().padStart(2, '0');
+      const m = now.getMinutes().toString().padStart(2, '0');
+      document.getElementById('clock').textContent = h + ':' + m;
+    }
+    updateClock();
+    setInterval(updateClock, 1000);
+
+    // 星を生成
+    const starsContainer = document.getElementById('stars');
+    for (let i = 0; i < 60; i++) {
+      const star = document.createElement('div');
+      star.className = 'star';
+      star.style.left = Math.random() * 100 + '%';
+      star.style.top = Math.random() * 100 + '%';
+      star.style.setProperty('--dur', (1.5 + Math.random() * 3) + 's');
+      star.style.animationDelay = (Math.random() * 3) + 's';
+      starsContainer.appendChild(star);
+    }
+
+    // タップ処理
+    function onTap() {
+      const toast = document.getElementById('toast');
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2500);
+    }
+  </script>
+</body>
+</html>
