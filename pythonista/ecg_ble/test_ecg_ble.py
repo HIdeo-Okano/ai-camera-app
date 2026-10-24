@@ -165,6 +165,7 @@ class World(object):
         self.hide_service = hide_service  # True: アドバタイズにサービス UUID が載らない（名前でしか見つからない）
         self.device_visible = device_visible  # True: アプリが電波を出していなくても iPad 本体が名前で見える
         self.timers = []                  # _later(sec, fn) で予約された処理
+        self.main = 0                     # >0 のときメインスレッドで動いている（デリゲート・_main の中）
         self.q = []
         self.pm = self.cm = None
         self.remote = None
@@ -173,14 +174,21 @@ class World(object):
         self.advertising = False
 
     def call(self, delegate, name, *args):
-        self.q.append(lambda: delegate.methods[name](None, None, *args))
+        self.q.append(lambda: self.on_main(delegate.methods[name], None, None, *args))
+
+    def on_main(self, fn, *args):
+        self.main += 1
+        try:
+            return fn(*args)
+        finally:
+            self.main -= 1
 
     def fire(self, name):
         """予約された処理のうち、名前が name のものを実行する（時間がたったことにする）。"""
         due = [f for sec, f in self.timers if f.__name__ == name]
         self.timers = [(sec, f) for sec, f in self.timers if f.__name__ != name]
         for f in due:
-            f()
+            self.on_main(f)
         self.run()
         return len(due)
 
@@ -289,7 +297,7 @@ class FPM(object):
 
         def deliver(v=bytes(data)):  # 実機と同じく、通知ごとに value を更新してからデリゲートを呼ぶ
             rch.val = v
-            d.methods["peripheral_didUpdateValueForCharacteristic_error_"](None, None, w.remote, rch, None)
+            w.on_main(d.methods["peripheral_didUpdateValueForCharacteristic_error_"], None, None, w.remote, rch, None)
         w.q.append(deliver)
         return True
 
@@ -359,6 +367,11 @@ class FOther(object):
         return "smarlife(2)"
 
 
+class FNoName(object):
+    def name(self):
+        return None
+
+
 class FCM(object):
     def initWithDelegate_queue_(self, d, q):
         self.d = d
@@ -380,10 +393,12 @@ class FCM(object):
 
     def discover(self):
         w = W[0]
+        assert w is not None
         if self.filtered and (w.hide_service or not w.advertising):
             return
-        if not self.filtered:  # 名前で探すときは、関係ない機器も見つかる
+        if not self.filtered:  # 名前で探すときは、関係ない機器（名前のないものも）見つかる
             w.call(self.d, "centralManager_didDiscoverPeripheral_advertisementData_RSSI_", self, FOther(), FAdv(None), -60)
+            w.call(self.d, "centralManager_didDiscoverPeripheral_advertisementData_RSSI_", self, FNoName(), None, -70)
         w.remote = FRemote(w.pm)
         w.call(self.d, "centralManager_didDiscoverPeripheral_advertisementData_RSSI_", self, w.remote,
                FAdv(tx.core.BLE_NAME), -50)
@@ -438,7 +453,7 @@ def _install_fake_objc():
     m.ns = lambda x: x
     m.nsdata_to_bytes = lambda x: bytes(x)
     m.load_framework = lambda n: None
-    m.on_main_thread = lambda f: f
+    m.on_main_thread = lambda f: (lambda: W[0].on_main(f))
 
     def create_objc_class(name, methods=(), protocols=()):
         for f in methods:
@@ -458,7 +473,13 @@ def _install_fake_objc():
         mod._CB.clear()
         # タイマーは記録だけして、テストの中で W[0].fire() で時間を進める。
         # 引数付きの呼び出しは Pythonista で失敗したので、(sec, fn) 以外は受け付けない
-        mod._later = lambda sec, fn: W[0].timers.append((sec, fn))
+        mod._later = _fake_later
+
+
+def _fake_later(sec, fn):
+    # iPad では、ボタン用の別スレッドから予約した直後に Pythonista が落ちた（実機で発生）
+    assert W[0].main > 0, "_later はメインスレッドから呼ぶこと: %s" % fn.__name__
+    W[0].timers.append((sec, fn))
 
 
 class CoreBluetoothFlowTest(unittest.TestCase):

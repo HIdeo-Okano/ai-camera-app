@@ -15,7 +15,7 @@ SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
 BLE_NAME = "ECG-TX"
-BLE_VERSION = "2026-10-25 r7"     # 起動時に表示（どのファイルが動いているか確かめるため）
+BLE_VERSION = "2026-10-25 r8"     # 起動時に表示（どのファイルが動いているか確かめるため）
 # 受信側（iPhone）は、まずサービス UUID で iPad を探す。WIDE_SCAN_AFTER 秒見つからなければ、
 # 下の名前の機器も探す（接続後にサービスを確かめるので、別の機器につながることはない）。
 IPAD_NAMES = ("TB016", BLE_NAME)
@@ -139,8 +139,9 @@ def _main(fn):
 
 
 def _later(sec, fn):
-    """sec 秒後にメインスレッドで fn() を呼ぶ。
-    引数を付けて on_main_thread に渡すと Pythonista では ArgumentError やクラッシュになったため、
+    """sec 秒後にメインスレッドで fn() を呼ぶ。必ずメインスレッド（デリゲートの中や _main 経由）から呼ぶこと。
+    ボタン用の別スレッドから予約すると、そのスレッドが終わった後に iPad の Pythonista が落ちた。
+    また引数を付けて on_main_thread に渡すと ArgumentError やクラッシュになったため、
     引数は渡さず、必要な値はオブジェクトに持たせておく。"""
     import ui
     ui.delay(fn, sec)
@@ -363,15 +364,16 @@ class BleSender(_BleBase):
             raise RuntimeError("送信中です。終わるまでお待ちください")
         if not 0 < len(data) <= MAX_SIZE:
             raise ValueError("サイズが不正です（%d バイト）" % len(data))
-        job = self.job = {"name": name, "data": data, "fmt": fmt, "timeout": timeout}
-        _main(self._go)
-        self._timeout_job = job
-        _later(timeout, self._check_timeout)
+        self.job = {"name": name, "data": data, "fmt": fmt, "timeout": timeout}
+        _main(self._go)   # ここ（ボタン用の別スレッド）ではタイマーを予約しない
 
     def _ready(self):
         self.pump(self._notify)
 
     def _go(self):
+        # メインスレッドで動いているので、ここでタイムアウトを予約する
+        self._timeout_job = self.job
+        _later(self.job["timeout"], self._check_timeout)
         if not self.ready:
             self.on_log("Bluetooth の準備を待っています…")
         elif self._central is not None:   # iPhone がもう接続して待っている
@@ -591,10 +593,7 @@ class BleReceiver(_BleBase):
         if self.per is not None:
             return
         if self._wide:  # 名前で探しているときは、名前が一致する機器だけ
-            names = [str(p.name() or "")]
-            if adv is not None and adv.objectForKey_("kCBAdvDataLocalName"):
-                names.append(str(adv.objectForKey_("kCBAdvDataLocalName")))
-            if not any(n.lower() == x.lower() for n in names for x in IPAD_NAMES):
+            if not self._name_matches(p):
                 return
         self.cm.stopScan()
         self.per = p
@@ -603,6 +602,15 @@ class BleReceiver(_BleBase):
         self.cm.connectPeripheral_options_(p, None)
         self._watch = p
         _later(CONNECT_TIMEOUT, self._check_watchdog)
+
+    @staticmethod
+    def _name_matches(p):
+        try:
+            name = p.name()
+            name = str(name) if name is not None else ""
+        except Exception:   # 名前を読めない機器は対象外
+            return False
+        return name.lower() in [x.lower() for x in IPAD_NAMES]
 
     def _check_watchdog(self):
         p, self._watch = self._watch, None
