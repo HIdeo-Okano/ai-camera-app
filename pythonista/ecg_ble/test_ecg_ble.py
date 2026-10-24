@@ -110,6 +110,12 @@ class BleTest(unittest.TestCase):
         self.assertIn(sec, core_src("ecg_sender_ipad.py"))
         self.assertNotIn("socket", core_src("ecg_sender_ipad.py"))
 
+    def test_main_waits_until_closed(self):
+        # スクリプトが先に終わると Pythonista が変数を片付け、BLE の通知で NameError になる（実機で発生）
+        for mod in (tx, rx):
+            src = mod.main.__code__.co_names
+            self.assertIn("wait_modal", src, mod.__name__)
+
     def test_real_csv_roundtrip(self):
         name, raw = sample_csv()
         src = tx.prepare(name, raw)                                 # iPad 側：読み込み・解析

@@ -1067,6 +1067,9 @@ class Sender(ui.View):
 def main():
     v = Sender()
     v.present("fullscreen", hide_title_bar=True)
+    # 画面を閉じるまでスクリプトを終わらせない。終わると Pythonista が変数を片付けてしまい、
+    # あとから届く BLE の通知で NameError（free variable ... referenced before assignment）になる。
+    v.wait_modal()
     return v
 
 

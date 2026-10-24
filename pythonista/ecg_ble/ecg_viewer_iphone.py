@@ -1572,6 +1572,9 @@ def main():
     v = ECGViewer()
     v.start_receiver()
     v.present("fullscreen", hide_title_bar=True, orientations=["portrait", "landscape"])
+    # 画面を閉じるまでスクリプトを終わらせない。終わると Pythonista が変数を片付けてしまい、
+    # あとから届く BLE の通知で NameError（free variable ... referenced before assignment）になる。
+    v.wait_modal()
     return v
 
 
