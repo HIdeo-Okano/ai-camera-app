@@ -55,6 +55,26 @@ def show_previous():
     print("========== ここまで ==========\n")
 
 
+def find_sender():
+    """ecg_sender_ipad.py を探す。見つからなければファイル選択の画面で選んでもらう。"""
+    places = [HERE, os.path.expanduser("~/Documents"),
+              "/private/var/mobile/Library/Mobile Documents/com~apple~CloudDocs/Downloads",
+              "/private/var/mobile/Library/Mobile Documents/com~apple~CloudDocs"]
+    for d in places:
+        path = os.path.join(d, "ecg_sender_ipad.py")
+        try:
+            with open(path, "rb"):
+                return path
+        except OSError:
+            continue
+    write("    ecg_sender_ipad.py が見つからないので、ファイル選択の画面を出します。ecg_sender_ipad.py を選んでください")
+    import dialogs
+    path = dialogs.pick_document(types=["public.python-script", "public.text", "public.data"])
+    if not path:
+        raise RuntimeError("ecg_sender_ipad.py が選ばれませんでした")
+    return path
+
+
 def main():
     show_previous()
     if LOG:
@@ -64,13 +84,16 @@ def main():
     keep = {}
 
     def s1():
-        if not os.path.exists(os.path.join(HERE, "ecg_sender_ipad.py")):
-            raise RuntimeError("同じフォルダーに ecg_sender_ipad.py がありません（名前に番号が付いていないか確認）")
-        sys.path.insert(0, HERE)
+        path = find_sender()
+        write("    読み込むファイル = %s" % path)
+        import importlib.util
         sys.modules.pop("ecg_sender_ipad", None)
-        import ecg_sender_ipad
-        keep["mod"] = ecg_sender_ipad
-        write("    版 = %s ／ 記録の保存先 = %s" % (ecg_sender_ipad.core.BLE_VERSION, ecg_sender_ipad.core.TRACE_DIR))
+        spec = importlib.util.spec_from_file_location("ecg_sender_ipad", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["ecg_sender_ipad"] = mod
+        spec.loader.exec_module(mod)
+        keep["mod"] = mod
+        write("    版 = %s ／ 記録の保存先 = %s" % (mod.core.BLE_VERSION, mod.core.TRACE_DIR))
 
     def s2():
         keep["view"] = keep["mod"].Sender()
