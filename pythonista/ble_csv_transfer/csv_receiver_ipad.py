@@ -11,7 +11,8 @@ Pythonista 標準の `cb` モジュールはセントラル (接続する側) �
 使い方:
   1. iPad の Pythonista でこのスクリプトを実行する
   2. 「アドバタイズ開始」と表示されたら iPhone 側で送信スクリプトを実行する
-  3. 受信したファイルは Pythonista の Documents/received_csv/ に保存される
+  3. 受信したファイルは iPad の「ダウンロード」フォルダー (iCloud Drive/Downloads) に保存される
+     (書き込めない場合は Pythonista 内の Documents/received_csv/ に保存)
   終了するときは Pythonista の停止ボタン (×) を押してください。
 
 転送プロトコル (1 書き込み = 1 パケット):
@@ -32,7 +33,47 @@ DATA_CHAR_UUID = '6E400002-B5A3-F393-E0A9-E50E24DCCA9E'    # iPhone -> iPad (Wri
 STATUS_CHAR_UUID = '6E400003-B5A3-F393-E0A9-E50E24DCCA9E'  # iPad -> iPhone (Notify/Read)
 LOCAL_NAME = 'CSV-RX'
 
-SAVE_DIR = os.path.expanduser('~/Documents/received_csv')
+# 保存先: iPad の「ダウンロード」フォルダー (上から順に書き込めるものを使う)
+#   - iCloud Drive/Downloads … Safari 等の既定のダウンロード先
+#   - このiPad内/Downloads   … Pythonista で「Open External Folder」した場合のみ書き込み可
+# 上記に書き込めない場合は Pythonista 内の Documents/received_csv に保存する。
+# 任意のフォルダーにしたい場合は SAVE_DIR_OVERRIDE にパスを書く。
+SAVE_DIR_OVERRIDE = None
+ICLOUD_DRIVE = '/private/var/mobile/Library/Mobile Documents/com~apple~CloudDocs'
+DOWNLOAD_DIR_CANDIDATES = [
+    os.path.join(ICLOUD_DRIVE, 'Downloads'),
+    '/private/var/mobile/Containers/Shared/AppGroup/*/File Provider Storage/Downloads',
+]
+FALLBACK_SAVE_DIR = os.path.expanduser('~/Documents/received_csv')
+
+
+def _writable(d):
+    try:
+        if not os.path.isdir(d):
+            return False
+        probe = os.path.join(d, '.csv_rx_write_test')
+        with open(probe, 'wb') as f:
+            f.write(b'')
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def resolve_save_dir(candidates=None, fallback=FALLBACK_SAVE_DIR, override=None):
+    """書き込み可能なダウンロードフォルダーを探す。見つからなければ fallback を返す。"""
+    import glob
+    override = override if override is not None else SAVE_DIR_OVERRIDE
+    if override:
+        return override, True
+    for pattern in (candidates if candidates is not None else DOWNLOAD_DIR_CANDIDATES):
+        for d in sorted(glob.glob(pattern)) if '*' in pattern else [pattern]:
+            if _writable(d):
+                return d, True
+    return fallback, False
+
+
+SAVE_DIR = FALLBACK_SAVE_DIR
 
 
 class TransferError(Exception):
@@ -42,8 +83,8 @@ class TransferError(Exception):
 class CSVAssembler(object):
     """受信パケットを組み立ててファイルとして保存する (BLE に依存しない部分)"""
 
-    def __init__(self, save_dir=SAVE_DIR, log=print):
-        self.save_dir = save_dir
+    def __init__(self, save_dir=None, log=print):
+        self.save_dir = save_dir or SAVE_DIR
         self.log = log
         self.reset()
 
@@ -163,7 +204,14 @@ class Receiver(object):
         self.CBMutableService = ObjCClass('CBMutableService')
         self.CBMutableCharacteristic = ObjCClass('CBMutableCharacteristic')
 
-        self.assembler = CSVAssembler()
+        self.save_dir, found = resolve_save_dir()
+        if found:
+            self.log('保存先 (ダウンロード): %s' % self.save_dir)
+        else:
+            self.log('ダウンロードフォルダーに書き込めないため Pythonista 内に保存します: %s' % self.save_dir)
+            self.log('  → Pythonista のファイル一覧で「Open External Folder」から')
+            self.log('    iCloud Drive の「ダウンロード」フォルダーを開くと、そこへ保存できます')
+        self.assembler = CSVAssembler(save_dir=self.save_dir)
         self.status_text = b'READY'
         self.status_char = None
         self.pending_notify = []
@@ -276,7 +324,7 @@ class Receiver(object):
             self.log('アドバタイズ開始に失敗: %s' % self.ObjCInstance(error))
             return
         self.log('アドバタイズ開始 (名前: %s)' % LOCAL_NAME)
-        self.log('iPhone からの送信を待っています... 保存先: %s' % SAVE_DIR)
+        self.log('iPhone からの送信を待っています... 保存先: %s' % self.save_dir)
 
     def on_write(self, pm, requests):
         result = ATT_SUCCESS

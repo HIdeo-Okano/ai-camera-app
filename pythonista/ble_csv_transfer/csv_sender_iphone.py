@@ -2,16 +2,17 @@
 """
 CSV BLE 送信プログラム (iPhone / Pythonista 3)
 
-iPhone に保存されている CSV ファイルを選択し、BLE で iPad
+iPhone の iCloud Drive 直下に保存されている ECGtsHDdata1.csv を、BLE で iPad
 (csv_receiver_ipad.py を実行中) へ転送します。
 Pythonista 標準の `cb` モジュール (BLE セントラル) を使用します。
 
 使い方:
   1. 先に iPad で csv_receiver_ipad.py を実行しておく
   2. iPhone の Pythonista でこのスクリプトを実行する
-  3. 送信する CSV ファイルを選ぶ
-     - Pythonista 内の CSV 一覧、または「ファイル」アプリから選択できます
-     - 引数でパスを渡すことも可能: csv_sender_iphone.py data.csv
+  3. iCloud Drive 直下の ECGtsHDdata1.csv が自動で送信される
+     - 直接読めない場合は「ファイル」アプリの画面が開くので、iCloud Drive の
+       ECGtsHDdata1.csv を選ぶ
+     - 引数で別のパスを渡すことも可能: csv_sender_iphone.py data.csv
   4. 「送信完了」と表示されれば成功 (iPad 側でも CRC を検証済み)
 """
 
@@ -32,6 +33,13 @@ LOCAL_NAME = 'CSV-RX'
 # 'D' + 連番 4 バイトを含めて 180 バイト以内に収める。
 PACKET_SIZE = 180
 PAYLOAD_SIZE = PACKET_SIZE - 5
+
+# 送信するファイル: iCloud Drive 直下の ECGtsHDdata1.csv
+SEND_FILE_NAME = 'ECGtsHDdata1.csv'
+ICLOUD_DRIVE_DIRS = [
+    '/private/var/mobile/Library/Mobile Documents/com~apple~CloudDocs',
+    '/var/mobile/Library/Mobile Documents/com~apple~CloudDocs',
+]
 
 SCAN_TIMEOUT = 30       # 受信側が見つかるまでの待ち時間 (秒)
 RESULT_TIMEOUT = 15     # 送信後、iPad からの結果通知を待つ時間 (秒)
@@ -173,32 +181,37 @@ class Sender(object):
             self.finish(text)
 
 
-def list_local_csv():
-    root = os.path.expanduser('~/Documents')
-    found = []
-    for d, _dirs, files in os.walk(root):
-        if os.sep + '.' in d or 'received_csv' in d:
+def default_file_candidates():
+    """iCloud Drive 直下の送信ファイルの候補パス"""
+    return [os.path.join(d, SEND_FILE_NAME) for d in ICLOUD_DRIVE_DIRS]
+
+
+def find_default_file(candidates=None):
+    """iCloud Drive 直下の SEND_FILE_NAME を探す。読めなければ None"""
+    for path in (candidates if candidates is not None else default_file_candidates()):
+        try:
+            with open(path, 'rb'):
+                return path
+        except (IOError, OSError):
             continue
-        for f in files:
-            if f.lower().endswith('.csv'):
-                found.append(os.path.join(d, f))
-    return sorted(found, key=os.path.getmtime, reverse=True)
+    return None
 
 
 def choose_file():
     if len(sys.argv) > 1:
         return sys.argv[1]
+    path = find_default_file()
+    if path:
+        print('送信ファイル: %s' % path)
+        return path
+    # サンドボックスの制限で直接読めない場合は「ファイル」アプリで選んでもらう
+    import console
     import dialogs
-    root = os.path.expanduser('~/Documents')
-    files_app = '📁 「ファイル」アプリから選択...'
-    local = list_local_csv()
-    items = [files_app] + [os.path.relpath(p, root) for p in local]
-    choice = dialogs.list_dialog('送信する CSV を選択', items)
-    if choice is None:
-        return None
-    if choice == files_app:
-        return dialogs.pick_document(types=['public.comma-separated-values-text', 'public.text'])
-    return os.path.join(root, choice)
+    console.alert('ファイルの選択',
+                  'iCloud Drive 直下の %s を直接読み込めませんでした。\n'
+                  '次の画面で「iCloud Drive」→「%s」を選んでください。' % (SEND_FILE_NAME, SEND_FILE_NAME),
+                  'OK', hide_cancel_button=True)
+    return dialogs.pick_document(types=['public.comma-separated-values-text', 'public.text', 'public.data'])
 
 
 def main():

@@ -156,5 +156,38 @@ class ProtocolTest(unittest.TestCase):
         self.assertEqual(os.listdir(self.tmp), ['evil.csv'])
 
 
+class PathTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_save_dir_prefers_downloads(self):
+        downloads = os.path.join(self.tmp, 'Downloads')
+        os.mkdir(downloads)
+        missing = os.path.join(self.tmp, 'nothing', 'Downloads')
+        self.assertEqual(rx.resolve_save_dir([missing, downloads], 'fb', override=''),
+                         (downloads, True))
+        self.assertEqual(os.listdir(downloads), [])  # 書き込みテスト用ファイルは残さない
+
+    def test_save_dir_glob_and_fallback(self):
+        d = os.path.join(self.tmp, 'ABC', 'File Provider Storage', 'Downloads')
+        os.makedirs(d)
+        pattern = os.path.join(self.tmp, '*', 'File Provider Storage', 'Downloads')
+        self.assertEqual(rx.resolve_save_dir([pattern], 'fb', override=''), (d, True))
+        self.assertEqual(rx.resolve_save_dir([os.path.join(self.tmp, 'x')], 'fb', override=''),
+                         ('fb', False))
+
+    def test_find_default_file(self):
+        icloud = os.path.join(self.tmp, 'com~apple~CloudDocs', tx.SEND_FILE_NAME)
+        self.assertIsNone(tx.find_default_file([icloud]))
+        os.makedirs(os.path.dirname(icloud))
+        with open(icloud, 'w') as f:
+            f.write('t,ecg\n0,0.1\n')
+        self.assertEqual(tx.find_default_file(['/nonexistent/x.csv', icloud]), icloud)
+        self.assertTrue(tx.default_file_candidates()[0].endswith('com~apple~CloudDocs/ECGtsHDdata1.csv'))
+
+
 if __name__ == '__main__':
     unittest.main()

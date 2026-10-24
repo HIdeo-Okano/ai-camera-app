@@ -1,6 +1,6 @@
 # iPhone → iPad CSV 転送 (BLE / Pythonista)
 
-iPhone に保存された CSV ファイルを、Bluetooth Low Energy (BLE) で iPad に転送します。
+iPhone の **iCloud Drive 直下** に保存された `ECGtsHDdata1.csv` を、Bluetooth Low Energy (BLE) で iPad の **「ダウンロード」フォルダー** に転送します。
 
 | 役割 | 端末 | スクリプト | BLE の役割 |
 |------|------|-----------|-----------|
@@ -14,10 +14,21 @@ iPhone に保存された CSV ファイルを、Bluetooth Low Energy (BLE) で i
 
 1. 両方の端末で Bluetooth を ON にし、Pythonista に Bluetooth の使用を許可する
 2. **iPad** で `csv_receiver_ipad.py` を実行 →「アドバタイズ開始」と表示されるまで待つ
-3. **iPhone** で `csv_sender_iphone.py` を実行し、送信する CSV を選ぶ
-   - Pythonista 内の CSV 一覧、または「ファイル」アプリから選択
+3. **iPhone** で `csv_sender_iphone.py` を実行 → iCloud Drive 直下の `ECGtsHDdata1.csv` が自動で送信される
 4. iPhone に「送信完了」と表示されれば成功
-5. iPad では Pythonista の `Documents/received_csv/` に保存される (同名ファイルは `名前_1.csv` のように連番)
+5. iPad では「ダウンロード」フォルダー (`iCloud Drive/Downloads`) に保存される (同名ファイルは `ECGtsHDdata1_1.csv` のように連番)
+
+送信ファイル名は `csv_sender_iphone.py` の `SEND_FILE_NAME`、保存先は `csv_receiver_ipad.py` の `SAVE_DIR_OVERRIDE` で変更できます。
+
+### iCloud Drive へのアクセスについて (初回のみ)
+
+Pythonista はセキュリティ上、iCloud Drive を自由に読み書きできない場合があります。その場合は次のとおり動きます。
+
+- **iPhone (送信)**: 直接読めないときは「ファイル」アプリの選択画面が開くので、iCloud Drive の `ECGtsHDdata1.csv` を選ぶ。
+  ファイルが iCloud 上にしかない (未ダウンロード) 場合もこの画面で選べば取得されます。
+- **iPad (受信)**: ダウンロードフォルダーに書き込めないときは Pythonista 内の `Documents/received_csv/` に保存し、その旨を表示する。
+  Pythonista のファイル一覧で **「Open External Folder」→ iCloud Drive の「ダウンロード」** を一度開いておくと、以降はダウンロードフォルダーに直接保存されます。
+  (「このiPad内」の「ダウンロード」を使う場合も同様に Open External Folder で開いてください)
 
 転送中は両方の端末で Pythonista を前面に表示したままにしてください (バックグラウンドに回ると BLE 通信が止まります)。
 受信を終了するときは iPad 側で Pythonista の停止ボタンを押します。
