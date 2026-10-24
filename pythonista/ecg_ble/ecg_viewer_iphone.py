@@ -341,7 +341,7 @@ SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
 BLE_NAME = "ECG-TX"
-BLE_VERSION = "2026-10-25 r15"     # 起動時に表示（どのファイルが動いているか確かめるため）
+BLE_VERSION = "2026-10-25 r16"     # 起動時に表示（どのファイルが動いているか確かめるため）
 # 受信側（iPhone）はサービス UUID だけで iPad を探す（iPad の端末名は使わない）。
 # 名前で全機器を探す処理（サービスを指定しないスキャン）は、Pythonista で
 # ArgumentError になり、iPad 本体に何度もつなぎ直す原因にもなったため使わない。
@@ -563,11 +563,29 @@ def _delegate(base, methods, protocols):
 #   1つ処理するごとに ecg_ble_trace_<sender|receiver>.txt へ書いてすぐ保存する。
 #   Pythonista が落ちてもファイルは残るので、最後の行が「落ちる直前の処理」になる。
 #   保存先はこのスクリプトと同じフォルダー（「ファイル」アプリで見つけやすい）。前回の記録は _prev.txt に残す。
-try:
-    TRACE_DIR = os.path.dirname(os.path.abspath(__file__))
-except NameError:
-    TRACE_DIR = os.path.expanduser("~/Documents")
+#   ただし「ファイル」アプリから開いたスクリプトは、そのフォルダーに書き込めない（PermissionError）ので、
+#   そのときは Pythonista 自身の Documents に置く。
 _OLD_TRACE_DIR = os.path.expanduser("~/Documents")   # r10〜r14 の保存先
+
+
+def _trace_dir():
+    try:
+        dirs = [os.path.dirname(os.path.abspath(__file__))]
+    except NameError:
+        dirs = []
+    for d in dirs + [_OLD_TRACE_DIR]:
+        try:
+            probe = os.path.join(d, ".ecg_ble_write_test")
+            with open(probe, "w"):
+                pass
+            os.remove(probe)
+            return d
+        except OSError:
+            continue
+    return _OLD_TRACE_DIR
+
+
+TRACE_DIR = _trace_dir()
 _TRACE = {"path": None}
 
 
