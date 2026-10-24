@@ -115,6 +115,9 @@ class BleTest(unittest.TestCase):
         for mod in (tx, rx):
             src = mod.main.__code__.co_names
             self.assertIn("wait_modal", src, mod.__name__)
+            # wait_modal で止めている間に後回しにされないよう、ボタン処理は ui.in_background を使わない
+            with open(mod.__file__, encoding="utf-8") as f:
+                self.assertNotIn("ui.in_background", f.read(), mod.__name__)
 
     def test_real_csv_roundtrip(self):
         name, raw = sample_csv()

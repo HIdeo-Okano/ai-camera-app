@@ -926,6 +926,18 @@ except ImportError:
 DOC_TYPES = ["public.comma-separated-values-text", "public.plain-text", "public.text", "public.data"]
 
 
+def in_thread(fn):
+    """Pythonista の in_background の代わり。main() が wait_modal() でスクリプトを止めている間も
+    動くよう、ボタンの処理（ファイル選択・送信など）を別スレッドで実行する。"""
+    import functools
+    import threading
+
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True).start()
+    return run
+
+
 def prepare(name, raw, fmt="auto"):
     """元ファイルを読み、送信する4行ヘッダ CSV の材料を返す。"""
     d = core.parse_csv(raw.decode("utf-8-sig", "replace"), fmt)
@@ -1001,7 +1013,7 @@ class Sender(ui.View):
             self.log_v.text = (self.log_v.text + "\n" if self.log_v.text else "") + m
         ui.delay(go, 0)
 
-    @ui.in_background
+    @in_thread
     def pick(self, sender=None):
         if dialogs is None:
             return
@@ -1026,7 +1038,7 @@ class Sender(ui.View):
         self.arr_t.text = str(s["arr"])
         self.log("選択: %s（%s）" % (name, d["hdr"]))
 
-    @ui.in_background
+    @in_thread
     def send(self, sender=None):
         if not self.src:
             self.log("先に CSV を選んでください")

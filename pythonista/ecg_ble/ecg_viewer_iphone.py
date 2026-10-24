@@ -933,6 +933,18 @@ FS = core.FS
 SAVE_DIR = os.environ.get("ECG_SAVE_DIR") or os.path.join(os.path.expanduser("~/Documents"), "Downloads")
 DOC_TYPES = ["public.comma-separated-values-text", "public.plain-text", "public.text", "public.data"]
 
+
+def in_thread(fn):
+    """Pythonista の in_background の代わり。main() が wait_modal() でスクリプトを止めている間も
+    動くよう、ボタンの処理（ファイル選択・送信など）を別スレッドで実行する。"""
+    import functools
+    import threading
+
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True).start()
+    return run
+
 LIGHT = dict(bg="#f4f5f7", panel="#ffffff", ink="#1b1f24", sub="#5d6772", line="#d9dde2",
              grid="#f0d4d4", grid2="#e3b8b8", wave="#14202b", ok="#1a8a4a", early="#d9730d",
              pause="#2563c9", warn="#c62828", lead="#8a96a3", btn="#1f2d3d", btnink="#ffffff",
@@ -1378,7 +1390,7 @@ class ECGViewer(ui.View):
             self.log = "表示中: %s" % path.replace(os.path.expanduser("~"), "~")
         self.render()
 
-    @ui.in_background
+    @in_thread
     def pick_file(self, sender=None):
         if dialogs is None:
             return
@@ -1399,7 +1411,7 @@ class ECGViewer(ui.View):
         self.msg = ""
         self.render()
 
-    @ui.in_background
+    @in_thread
     def share(self, sender=None):
         """6.3 iPhoneからPCへの転送：共有シート（AirDrop・ファイルAppへ保存 など）。"""
         if not self.meta or console is None:
