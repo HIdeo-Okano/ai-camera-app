@@ -29,8 +29,9 @@ class FakeService(object):
 class FakePeripheral(object):
     """iPad 側 (CSVAssembler) につながった模擬ペリフェラル"""
 
-    def __init__(self, name, uuid, assembler=None, corrupt_seq=None):
+    def __init__(self, name, uuid, assembler=None, corrupt_seq=None, silent=False):
         self.name = name
+        self.silent = silent  # True: 接続しても応答しない機器
         self.uuid = uuid
         self.assembler = assembler
         self.corrupt_seq = corrupt_seq
@@ -95,7 +96,7 @@ def make_fake_cb(peripherals):
     cb.set_central_delegate = set_central_delegate
     cb.scan_for_peripherals = scan_for_peripherals
     cb.stop_scan = lambda: None
-    cb.connect_peripheral = lambda p: state['delegate'].did_connect_peripheral(p)
+    cb.connect_peripheral = lambda p: None if p.silent else state['delegate'].did_connect_peripheral(p)
     cb.cancel_peripheral_connection = cancel
     cb.reset = lambda: None
     return cb
@@ -109,20 +110,34 @@ class ProtocolTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def run_transfer(self, name, data, **kw):
+    def run_transfer(self, name, data, target_name='CSV-RX', extra=(), **kw):
         peers = [FakePeripheral('Someone iPad', 'other'),           # サービス無し -> スキップされる
                  FakePeripheral('Speaker', 'spk'),                  # 名前が一致しない
-                 FakePeripheral('CSV-RX', 'target', self.assembler, **kw)]
+                 FakePeripheral(None, 'noname')] + list(extra) + \
+                [FakePeripheral(target_name, 'target', self.assembler, **kw)]
         tx.cb = make_fake_cb(peers)
         sender = tx.Sender(name, data)
         sender.log = lambda m: None
         tx.cb.set_central_delegate(sender)
         tx.cb.scan_for_peripherals()
         target = peers[-1]
-        while target.queue:
-            target.queue.pop(0)()
+        now = sender.scan_started
+        for _ in range(200):  # メインループ (0.5 秒刻みの模擬時間)
+            now += 0.5
+            sender.poll(now)
+            while target.queue:
+                target.queue.pop(0)()
+            if sender.done.is_set():
+                break
         self.assertTrue(sender.done.is_set())
         return sender
+
+    def test_ipad_with_custom_name_found_by_service(self):
+        data = b't,ecg\n' + b'0.001,0.12\n' * 200
+        sender = self.run_transfer('ECGtsHDdata1.csv', data, target_name='smarlife',
+                                   extra=[FakePeripheral('Watch', 'w', silent=True)])
+        self.assertEqual(sender.result, 'OK:ECGtsHDdata1.csv')
+        self.assertIn('w', sender.tried)  # 応答しない機器はタイムアウトで飛ばされる
 
     def test_roundtrip_japanese_csv(self):
         data = ''.join('%d,名前%d,東京都,%f\r\n' % (i, i, i * 1.5) for i in range(3000)).encode('utf-8')

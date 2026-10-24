@@ -41,10 +41,17 @@ ICLOUD_DRIVE_DIRS = [
     '/var/mobile/Library/Mobile Documents/com~apple~CloudDocs',
 ]
 
-SCAN_TIMEOUT = 30       # 受信側が見つかるまでの待ち時間 (秒)
+SCAN_TIMEOUT = 60       # 受信側が見つかるまでの待ち時間 (秒)
+CONNECT_TIMEOUT = 8     # 1 台の機器への接続・サービス確認を待つ時間 (秒)
+HINT_WAIT = 3           # 名前が一致する機器を優先して待つ時間 (秒)
 RESULT_TIMEOUT = 15     # 送信後、iPad からの結果通知を待つ時間 (秒)
-# 名前でアドバタイズを判別できない場合に接続を試す端末名のキーワード
+# 優先して接続を試す端末名のキーワード (一致しない機器も順に確認するので必須ではない)
 NAME_HINTS = (LOCAL_NAME, 'iPad')
+
+
+def is_hint(name):
+    name = (name or '').lower()
+    return any(h.lower() in name for h in NAME_HINTS)
 
 
 def build_packets(name, data):
@@ -77,7 +84,12 @@ class Sender(object):
         self.peripheral = None
         self.data_char = None
         self.status_char = None
-        self.tried = set()       # 接続を試したが対象サービスが無かった端末
+        self.lock = threading.RLock()
+        self.seen = set()        # 発見済みの機器
+        self.tried = set()       # 接続を試したが対象サービスが無かった機器
+        self.candidates = []     # 接続を試す順番待ちの機器
+        self.connect_at = 0.0
+        self.scan_started = time.time()
         self.done = threading.Event()
         self.result = None       # 'OK:...' / 'ERR:...'
         self.sent_all = False
@@ -93,48 +105,83 @@ class Sender(object):
             self.done.set()
 
     # ---- スキャン / 接続 ----
+    # 端末名に頼らず「CSV 受信サービスを持っているか」で iPad を判別する。
+    # 名前が NAME_HINTS に一致する機器を優先し、一致しなければ名前のある機器へ順に接続して確かめる。
     def did_discover_peripheral(self, p):
-        if self.peripheral is not None or p.uuid in self.tried:
+        if not p.name:
             return
-        name = p.name or ''
-        if not any(h.lower() in name.lower() for h in NAME_HINTS):
-            return
-        self.log('受信側候補を発見: %s' % name)
-        self.peripheral = p
-        cb.stop_scan()
+        with self.lock:
+            if p.uuid in self.tried or p.uuid in self.seen:
+                return
+            self.seen.add(p.uuid)
+            if is_hint(p.name):
+                self.candidates.insert(0, p)
+            else:
+                self.candidates.append(p)
+        self.log('  発見: %s' % p.name)
+
+    def poll(self, now):
+        """メインループから定期的に呼ぶ。候補への接続と接続タイムアウトを管理する。"""
+        with self.lock:
+            if self.done.is_set() or self.data_char is not None:
+                return
+            if self.peripheral is not None:
+                if now - self.connect_at > CONNECT_TIMEOUT:
+                    p = self.peripheral
+                    self.log('  %s から応答がないため次の機器を試します' % p.name)
+                    self.give_up(p)
+                    cb.cancel_peripheral_connection(p)
+                return
+            if not self.candidates:
+                return
+            if not is_hint(self.candidates[0].name) and now - self.scan_started < HINT_WAIT:
+                return  # 名前が一致する機器が見つかるのを少し待つ
+            p = self.candidates.pop(0)
+            self.peripheral = p
+            self.connect_at = now
+        self.log('接続を試します: %s' % p.name)
         cb.connect_peripheral(p)
 
+    def is_current(self, p):
+        return self.peripheral is not None and self.peripheral.uuid == p.uuid
+
+    def give_up(self, p):
+        """対象ではなかった機器を除外して次の候補へ"""
+        with self.lock:
+            self.tried.add(p.uuid)
+            if self.is_current(p):
+                self.peripheral = None
+                self.data_char = self.status_char = None
+
     def did_connect_peripheral(self, p):
-        self.log('接続しました: %s' % p.name)
-        p.discover_services()
+        if self.is_current(p):
+            self.log('  接続しました。サービスを確認中...')
+            p.discover_services()
 
     def did_fail_to_connect_peripheral(self, p, error):
-        self.log('接続に失敗: %s' % error)
-        self.retry_scan(p)
+        if self.is_current(p):
+            self.log('  接続に失敗: %s' % error)
+            self.give_up(p)
 
     def did_disconnect_peripheral(self, p, error):
-        if self.done.is_set():
+        if self.done.is_set() or not self.is_current(p):
             return
         if self.sent_all:
             self.finish('ERR:結果を受け取る前に切断されました')
         elif self.data_char is not None:
             self.finish('ERR:転送中に切断されました (%s)' % error)
         else:
-            self.retry_scan(p)
-
-    def retry_scan(self, p):
-        """対象ではなかった端末を除外してスキャンをやり直す"""
-        self.tried.add(p.uuid)
-        self.peripheral = None
-        self.data_char = self.status_char = None
-        cb.scan_for_peripherals()
+            self.give_up(p)
 
     def did_discover_services(self, p, error):
-        for s in p.services:
+        if not self.is_current(p):
+            return
+        for s in (p.services or []):
             if s.uuid.upper() == SERVICE_UUID:
                 p.discover_characteristics(s)
                 return
-        self.log('  CSV 受信サービスが無いため別の端末を探します')
+        self.log('  CSV 受信サービスが無いため次の機器を試します')
+        self.give_up(p)
         cb.cancel_peripheral_connection(p)
 
     def did_discover_characteristics(self, s, error):
@@ -147,6 +194,8 @@ class Sender(object):
         if self.data_char is None or self.status_char is None:
             self.finish('ERR:必要なキャラクタリスティックが見つかりません')
             return
+        cb.stop_scan()
+        self.log('iPad を見つけました: %s' % self.peripheral.name)
         # 結果通知を購読してから送信を開始する
         self.peripheral.set_notify_value(self.status_char, True)
         self.log('送信開始: %s (%d bytes, %d パケット)' % (self.name, len(self.data), len(self.packets)))
@@ -229,12 +278,14 @@ def main():
     sender = Sender(os.path.basename(path), data)
     cb.set_central_delegate(sender)
     sender.log('iPad (%s) を探しています...' % LOCAL_NAME)
+    sender.scan_started = time.time()
     cb.scan_for_peripherals()
     try:
         deadline = time.time() + SCAN_TIMEOUT
         while not sender.done.is_set():
             time.sleep(0.2)
             now = time.time()
+            sender.poll(now)
             if sender.data_char is None and now > deadline:
                 sender.finish('ERR:受信側が見つかりません。iPad で受信スクリプトを起動してください')
             if sender.data_char is not None:
