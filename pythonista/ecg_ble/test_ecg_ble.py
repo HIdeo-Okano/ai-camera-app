@@ -645,6 +645,15 @@ class CoreBluetoothFlowTest(unittest.TestCase):
                      "finish: on_done done"):
             self.assertIn(step, trace)
 
+    def test_previous_trace_shown_on_start(self):
+        with open(os.path.join(self.tmp, "ecg_ble_trace_sender.txt"), "w", encoding="utf-8") as f:
+            f.write("ECG BLE 動作記録\n12:00:00 objc startAdvertising:\n12:00:01 objc updateValue:forCharacteristic:onSubscribedCentrals:\n")
+        W[0] = World()
+        logs = []
+        snd = tx.core.BleSender(lambda m: logs.append(m), None)
+        snd.start()
+        self.assertTrue(any("前回 12:00:01 objc updateValue" in m for m in logs), "\n".join(logs))
+
     def test_end_sequence(self):
         logs = self.flow(True)
         w = W[0]

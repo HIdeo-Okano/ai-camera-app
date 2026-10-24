@@ -339,7 +339,7 @@ SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
 BLE_NAME = "ECG-TX"
-BLE_VERSION = "2026-10-25 r13"     # 起動時に表示（どのファイルが動いているか確かめるため）
+BLE_VERSION = "2026-10-25 r14"     # 起動時に表示（どのファイルが動いているか確かめるため）
 # 受信側（iPhone）はサービス UUID だけで iPad を探す（iPad の端末名は使わない）。
 # 名前で全機器を探す処理（サービスを指定しないスキャン）は、Pythonista で
 # ArgumentError になり、iPad 本体に何度もつなぎ直す原因にもなったため使わない。
@@ -458,6 +458,7 @@ def _send(obj, sel, sig, *args):
     """obj にメッセージ sel を送る。sig は「戻り値の型 + 引数の型」（@ ポインタ, B BOOL, q 整数, Q 符号なし整数,
     * C 文字列, v なし）。例：updateValue:forCharacteristic:onSubscribedCentrals: → "B@@@" """
     rt = _rt()
+    _trace("objc %s" % sel)
     fn = rt["fns"].get(sig)
     if fn is None:
         proto = ctypes.CFUNCTYPE(_CTYPE[sig[0]], ctypes.c_void_p, ctypes.c_void_p, *[_CTYPE[c] for c in sig[1:]])
@@ -561,6 +562,15 @@ def _delegate(base, methods, protocols):
 #   Pythonista が落ちてもファイルは残るので、最後の行が「落ちる直前の処理」になる。
 TRACE_DIR = os.path.expanduser("~/Documents")
 _TRACE = {"path": None}
+
+
+def _trace_last(role, n=25):
+    """前回の動作記録の最後の n 行（前回落ちた場所を画面で見るため）。"""
+    try:
+        with open(os.path.join(TRACE_DIR, "ecg_ble_trace_%s.txt" % role), encoding="utf-8") as f:
+            return f.read().splitlines()[-n:]
+    except Exception:
+        return []
 
 
 def _trace_start(role):
@@ -796,6 +806,12 @@ class BleSender(_BleBase):
 
     # --- BLE
     def start(self):
+        last = _trace_last("sender")
+        if last:
+            self.on_log("―― 前回の動作記録（最後の %d 行。前回落ちた場合は最後の行が落ちる直前の処理）――" % len(last))
+            for ln in last:
+                self.on_log("  前回 " + ln)
+            self.on_log("―― ここまで ――")
         _trace_start("sender")
         self.on_log("BLE 送信を開始します（版 %s）" % BLE_VERSION)
         _ACTIVE["sender"] = self
@@ -1000,6 +1016,12 @@ class BleReceiver(_BleBase):
 
     # --- BLE
     def start(self):
+        last = _trace_last("receiver")
+        if last:
+            self.on_log("―― 前回の動作記録（最後の %d 行。前回落ちた場合は最後の行が落ちる直前の処理）――" % len(last))
+            for ln in last:
+                self.on_log("  前回 " + ln)
+            self.on_log("―― ここまで ――")
         _trace_start("receiver")
         self.on_log("BLE 受信を開始します（版 %s）" % BLE_VERSION)
         _ACTIVE["receiver"] = self
