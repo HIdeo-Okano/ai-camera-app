@@ -114,10 +114,18 @@ class BleTest(unittest.TestCase):
         # スクリプトが先に終わると Pythonista が変数を片付け、BLE の通知で NameError になる（実機で発生）
         for mod in (tx, rx):
             src = mod.main.__code__.co_names
-            self.assertIn("wait_modal", src, mod.__name__)
+            # Python を動かさずに待つ（wait_modal で待つ間に Python が動くと objc_util が同時に使われた）
+            self.assertIn("wait", src, mod.__name__)
+            self.assertIn("Event", src, mod.__name__)
+            self.assertNotIn("wait_modal", src, mod.__name__)
             # wait_modal で止めている間に後回しにされないよう、ボタン処理は ui.in_background を使わない
             with open(mod.__file__, encoding="utf-8") as f:
-                self.assertNotIn("ui.in_background", f.read(), mod.__name__)
+                src_text = f.read()
+            self.assertNotIn("ui.in_background", src_text, mod.__name__)
+            # CoreBluetooth は別スレッドから触らない（objc_util はスレッドに安全ではない）
+            self.assertNotIn("on_main_thread(", src_text, mod.__name__)
+        with open(tx.__file__, encoding="utf-8") as f:
+            self.assertNotIn("@in_thread\n    def send", f.read())
 
     def test_real_csv_roundtrip(self):
         name, raw = sample_csv()
@@ -511,7 +519,7 @@ class CoreBluetoothFlowTest(unittest.TestCase):
             W[0].run()
             rcv.start()
         W[0].run()
-        snd.send(name, raw, "4")
+        W[0].on_main(snd.send, name, raw, "4")   # ボタンの action（メインスレッド）
         W[0].run()
         self.assertTrue(any(tx.core.BLE_VERSION in m for m in logs), "\n".join(logs))   # 版が表示される
         errors = [m for m in logs if "エラー" in m]
@@ -563,7 +571,7 @@ class CoreBluetoothFlowTest(unittest.TestCase):
         # 2回目の送信（同じ iPad 画面からもう一度「送信」）
         snd = [o for o in gc_objs() if isinstance(o, tx.core.BleSender)][-1]
         snd.on_done = lambda ok, msg: done.append((ok, msg))
-        snd.send(name, raw, "4")
+        W[0].on_main(snd.send, name, raw, "4")   # ボタンの action（メインスレッド）
         W[0].run()
         self.assertEqual(done, [(True, name)], "\n".join(logs))
 

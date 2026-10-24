@@ -333,13 +333,17 @@ def analyze(d):
 #     iPad   … 応答を受け取ったらアドバタイズを止め、BLE の準備は残したまま次の「送信」を待つ
 #   ※ Pythonista の cb モジュールは使わない（Pythonista 3.4 では書き込みが PY_SSIZE_T_CLEAN エラーになる）。
 #     両側とも objc_util で CoreBluetooth を直接使う。
+#   ※ objc_util はスレッドに安全ではない（呼び出しのたびに共有の objc_msgSend の型設定を書き換える）。
+#     2つのスレッドから同時に使うと 'tuple' object is not callable などの ArgumentError や
+#     アプリの強制終了になったため、CoreBluetooth の操作はすべてメインスレッドだけで行う。
+#     （デリゲート・ui.delay の予約・ボタンの action はメインスレッドで動く）
 import zlib
 
 SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
 BLE_NAME = "ECG-TX"
-BLE_VERSION = "2026-10-25 r10"     # 起動時に表示（どのファイルが動いているか確かめるため）
+BLE_VERSION = "2026-10-25 r11"     # 起動時に表示（どのファイルが動いているか確かめるため）
 # 受信側（iPhone）はサービス UUID だけで iPad を探す（iPad の端末名は使わない）。
 # 名前で全機器を探す処理（サービスを指定しないスキャン）は、Pythonista で
 # ArgumentError になり、iPad 本体に何度もつなぎ直す原因にもなったため使わない。
@@ -484,16 +488,8 @@ def _trace(msg):
         pass
 
 
-def _main(fn):
-    """CoreBluetooth の操作はメインスレッドで行う。fn は引数なしで呼ぶ。"""
-    from objc_util import on_main_thread
-    _trace("main> %s" % fn.__name__)
-    on_main_thread(fn)()
-    _trace("main< %s" % fn.__name__)
-
-
 def _later(sec, fn):
-    """sec 秒後にメインスレッドで fn() を呼ぶ。必ずメインスレッド（デリゲートの中や _main 経由）から呼ぶこと。
+    """sec 秒後にメインスレッドで fn() を呼ぶ。必ずメインスレッド（デリゲートやボタンの action）から呼ぶこと。
     ボタン用の別スレッドから予約すると、そのスレッドが終わった後に iPad の Pythonista が落ちた。
     また引数を付けて on_main_thread に渡すと ArgumentError やクラッシュになったため、
     引数は渡さず、必要な値はオブジェクトに持たせておく。"""
@@ -725,18 +721,18 @@ class BleSender(_BleBase):
             del _ACTIVE["sender"]
 
     def send(self, name, data, fmt="4", timeout=SEND_TIMEOUT):
+        """メインスレッドから呼ぶ。"""
         if self.job:
             raise RuntimeError("送信中です。終わるまでお待ちください")
         if not 0 < len(data) <= MAX_SIZE:
             raise ValueError("サイズが不正です（%d バイト）" % len(data))
         self.job = {"name": name, "data": data, "fmt": fmt, "timeout": timeout}
-        _main(self._go)   # ここ（ボタン用の別スレッド）ではタイマーを予約しない
+        self._go()   # send() はメインスレッド（ボタンの action）から呼ぶこと
 
     def _ready(self):
         self.pump(self._notify)
 
     def _go(self):
-        # メインスレッドで動いているので、ここでタイムアウトを予約する
         self._timeout_job = self.job
         _later(self.job["timeout"], self._check_timeout)
         if not self.ready:
@@ -1467,6 +1463,8 @@ class ECGViewer(ui.View):
     def will_close(self):
         if self.receiver:
             self.receiver.stop()
+        if getattr(self, "closed", None) is not None:
+            self.closed.set()
 
     def close_app(self, sender=None):
         self.will_close()
@@ -1685,12 +1683,16 @@ class ECGViewer(ui.View):
 
 
 def main():
+    import threading
     v = ECGViewer()
-    v.start_receiver()
+    v.closed = threading.Event()
     v.present("fullscreen", hide_title_bar=True, orientations=["portrait", "landscape"])
-    # 画面を閉じるまでスクリプトを終わらせない。終わると Pythonista が変数を片付けてしまい、
-    # あとから届く BLE の通知で NameError（free variable ... referenced before assignment）になる。
-    v.wait_modal()
+    ui.delay(v.start_receiver, 0)   # BLE はメインスレッドで開始する
+    # 画面を閉じるまでスクリプトを終わらせない（終わると Pythonista が変数を片付け、BLE の通知で
+    # NameError になる）。待つ間は Python のコードを一切動かさない Event.wait() にする。
+    # wait_modal() などで待つ間に Python が動くと、メインスレッドの objc_util と同時に動いて
+    # ArgumentError やクラッシュの原因になる。
+    v.closed.wait()
     return v
 
 
