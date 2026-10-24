@@ -161,8 +161,10 @@ class BleTest(unittest.TestCase):
 class World(object):
     """iPad（ペリフェラル）と iPhone（セントラル）の BLE イベントを順番に配送する。"""
 
-    def __init__(self, full_every=0, hide_service=False):
+    def __init__(self, full_every=0, hide_service=False, device_visible=False):
         self.hide_service = hide_service  # True: アドバタイズにサービス UUID が載らない（名前でしか見つからない）
+        self.device_visible = device_visible  # True: アプリが電波を出していなくても iPad 本体が名前で見える
+        self.timers = []                  # _later(sec, fn) で予約された処理
         self.q = []
         self.pm = self.cm = None
         self.remote = None
@@ -172,6 +174,15 @@ class World(object):
 
     def call(self, delegate, name, *args):
         self.q.append(lambda: delegate.methods[name](None, None, *args))
+
+    def fire(self, name):
+        """予約された処理のうち、名前が name のものを実行する（時間がたったことにする）。"""
+        due = [f for sec, f in self.timers if f.__name__ == name]
+        self.timers = [(sec, f) for sec, f in self.timers if f.__name__ != name]
+        for f in due:
+            f()
+        self.run()
+        return len(due)
 
     def run(self, limit=200000):
         for _ in range(limit):
@@ -296,8 +307,6 @@ class FRemote(object):
         self.pm = pm
         self.d = None
         self.svcs = []
-        for c in pm.svc.chars:
-            pass
 
     def name(self):
         return "TB016"
@@ -306,9 +315,12 @@ class FRemote(object):
         self.d = d
 
     def discoverServices_(self, uuids):
-        svc = FObj(self.pm.svc.uuid)
-        svc.chars = [FObj(c.uuid) for c in self.pm.svc.chars]
-        self.svcs = [svc]
+        if self.pm is None or self.pm.svc is None:   # iPad でアプリが動いていない
+            self.svcs = []
+        else:
+            svc = FObj(self.pm.svc.uuid)
+            svc.chars = [FObj(c.uuid) for c in self.pm.svc.chars]
+            self.svcs = [svc]
         W[0].call(self.d, "peripheral_didDiscoverServices_", self, None)
 
     def services(self):
@@ -363,12 +375,12 @@ class FCM(object):
         if self.filtered:
             assert uuids[0].UUIDString() == tx.core.SERVICE_UUID
         self.scanning = True
-        if W[0].advertising:
+        if W[0].advertising or (not self.filtered and W[0].device_visible):
             self.discover()
 
     def discover(self):
         w = W[0]
-        if self.filtered and w.hide_service:
+        if self.filtered and (w.hide_service or not w.advertising):
             return
         if not self.filtered:  # 名前で探すときは、関係ない機器も見つかる
             w.call(self.d, "centralManager_didDiscoverPeripheral_advertisementData_RSSI_", self, FOther(), FAdv(None), -60)
@@ -385,8 +397,9 @@ class FCM(object):
     def cancelPeripheralConnection_(self, p):
         w = W[0]
         w.call(self.d, "centralManager_didDisconnectPeripheral_error_", self, p, None)
-        dc = [c for c in w.pm.svc.chars if c.uuid.s == tx.core.DATA_UUID][0]
-        w.call(w.pm.d, "peripheralManager_central_didUnsubscribeFromCharacteristic_", w.pm, FCentral(), dc)
+        if w.pm is not None and w.pm.svc is not None:
+            dc = [c for c in w.pm.svc.chars if c.uuid.s == tx.core.DATA_UUID][0]
+            w.call(w.pm.d, "peripheralManager_central_didUnsubscribeFromCharacteristic_", w.pm, FCentral(), dc)
 
     def setDelegate_(self, d):
         pass
@@ -443,7 +456,9 @@ def _install_fake_objc():
     sys.modules["objc_util"] = m
     for mod in (tx, rx):
         mod._CB.clear()
-        mod._later = lambda sec, fn, *args: None   # タイムアウト用タイマーは使わない
+        # タイマーは記録だけして、テストの中で W[0].fire() で時間を進める。
+        # 引数付きの呼び出しは Pythonista で失敗したので、(sec, fn) 以外は受け付けない
+        mod._later = lambda sec, fn: W[0].timers.append((sec, fn))
 
 
 class CoreBluetoothFlowTest(unittest.TestCase):
@@ -476,8 +491,7 @@ class CoreBluetoothFlowTest(unittest.TestCase):
         W[0].run()
         if hide_service:
             self.assertEqual(done, [])               # サービス UUID では見つからない
-            rcv._wide_scan(rcv._scan_no)            # WIDE_SCAN_AFTER 秒後に名前でも探す
-            W[0].run()
+            self.assertEqual(W[0].fire("_check_wide"), 1)   # WIDE_SCAN_AFTER 秒後に名前でも探す
         self.assertTrue(any(tx.core.BLE_VERSION in m for m in logs), "\n".join(logs))   # 版が表示される
         errors = [m for m in logs if "エラー" in m]
         self.assertEqual(errors, [], "\n".join(logs))
@@ -487,6 +501,7 @@ class CoreBluetoothFlowTest(unittest.TestCase):
             self.assertEqual(f.read(), raw)
         self.assertFalse(W[0].advertising)                 # 送信後はアドバタイズを止める
         self.assertTrue(W[0].cm.scanning)                  # iPhone は次の送信を待って探し続ける
+        self.snd, self.rcv, self.logs, self.done = snd, rcv, logs, done
         return logs
 
     def test_flow_iphone_started_first(self):
@@ -498,6 +513,56 @@ class CoreBluetoothFlowTest(unittest.TestCase):
     def test_flow_found_by_name_when_service_not_advertised(self):
         logs = self.flow(True, hide_service=True)
         self.assertTrue(any("TB016" in m for m in logs), "\n".join(logs))
+
+    def test_end_sequence(self):
+        logs = self.flow(True)
+        w = W[0]
+        self.assertTrue(any("iPhone: 受信完了（1 件目）" in m for m in logs), "\n".join(logs))
+        self.assertTrue(any("iPad: 送信を終了しました（成功）" in m for m in logs), "\n".join(logs))
+        # 受信後の iPhone：サービス UUID だけで待つ（受信前に予約した「名前で探す」が来ても探さない）
+        self.assertTrue(w.cm.filtered)
+        n = len(logs)
+        w.fire("_check_wide")
+        self.assertTrue(w.cm.filtered)
+        self.assertEqual([m for m in logs[n:] if "名前" in m], [], "\n".join(logs))
+        self.assertIsNone(self.rcv.per)
+        # 時間がたっても（タイムアウト・接続確認）何も起きない
+        n = len(logs)
+        w.fire("_check_timeout")
+        w.fire("_check_watchdog")
+        self.assertEqual(self.done, [(True, sample_csv()[0])])
+        self.assertEqual([m for m in logs[n:] if "エラー" in m or "失敗" in m], [], "\n".join(logs))
+        self.assertFalse(w.advertising)
+
+    def test_iphone_connected_before_send(self):
+        """iPhone が名前で先に接続して待っていても、「送信」で送れる。"""
+        W[0] = World(device_visible=True)
+        logs, done, files = [], [], []
+        snd = tx.core.BleSender(lambda m: logs.append("iPad: " + m), lambda ok, msg: done.append((ok, msg)))
+        rcv = rx.core.BleReceiver(self.tmp, lambda p, f: files.append(p), lambda m: logs.append("iPhone: " + m))
+        snd.start()
+        rcv.start()
+        W[0].run()
+        self.assertEqual(W[0].fire("_check_wide"), 1)
+        self.assertTrue(any("「送信」を押すと送ります" in m for m in logs), "\n".join(logs))
+        name, raw = sample_csv()
+        snd.send(name, raw, "4")
+        W[0].run()
+        self.assertEqual(done, [(True, name)], "\n".join(logs))
+        self.assertEqual(len(files), 1)
+
+    def test_ipad_app_not_running(self):
+        """iPad 本体は名前で見えるがアプリが動いていない：つないでは切る、を繰り返さない。"""
+        W[0] = World(device_visible=True)
+        logs = []
+        rcv = rx.core.BleReceiver(self.tmp, lambda p, f: None, lambda m: logs.append(m))
+        rcv.start()
+        W[0].run()
+        self.assertEqual(W[0].fire("_check_wide"), 1)
+        self.assertTrue(any("送信の準備ができていません" in m for m in logs), "\n".join(logs))
+        self.assertIsNone(rcv.per)
+        self.assertTrue(W[0].cm.filtered)                  # サービス UUID だけで待つ
+        self.assertEqual(W[0].fire("_check_wide"), 0)      # しばらく名前では探さない
 
     def test_send_twice(self):
         logs = self.flow(True)

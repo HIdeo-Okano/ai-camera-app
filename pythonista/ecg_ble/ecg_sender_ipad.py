@@ -326,16 +326,18 @@ def analyze(d):
 #   データ：DATA キャラクタリスティックの Notify（1通知＝1パケット）
 #     b"H" + JSON（name, size, crc, fmt）／ b"D" + 連番4バイト + データ ／ b"E"（終了）
 #   応答：iPhone が ACK キャラクタリスティックへ "OK <保存したファイル名>" または "NG <理由>" を書き込む
+#   終わり方：
+#     iPhone … 応答を書き込んだら切断し、サービス UUID だけで次の送信を待つ（名前では探さない）
+#     iPad   … 応答を受け取ったらアドバタイズを止め、BLE の準備は残したまま次の「送信」を待つ
 #   ※ Pythonista の cb モジュールは使わない（Pythonista 3.4 では書き込みが PY_SSIZE_T_CLEAN エラーになる）。
 #     両側とも objc_util で CoreBluetooth を直接使う。
-import threading
 import zlib
 
 SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
 BLE_NAME = "ECG-TX"
-BLE_VERSION = "2026-10-25 r6"     # 起動時に表示（どのファイルが動いているか確かめるため）
+BLE_VERSION = "2026-10-25 r7"     # 起動時に表示（どのファイルが動いているか確かめるため）
 # 受信側（iPhone）は、まずサービス UUID で iPad を探す。WIDE_SCAN_AFTER 秒見つからなければ、
 # 下の名前の機器も探す（接続後にサービスを確かめるので、別の機器につながることはない）。
 IPAD_NAMES = ("TB016", BLE_NAME)
@@ -452,16 +454,18 @@ def _delegate(base, methods, protocols):
     return create_objc_class(name, methods=methods, protocols=protocols).new()
 
 
-def _main(fn, *args):
-    """CoreBluetooth の操作はメインスレッドで行う。"""
+def _main(fn):
+    """CoreBluetooth の操作はメインスレッドで行う。fn は引数なしで呼ぶ。"""
     from objc_util import on_main_thread
-    on_main_thread(fn)(*args)
+    on_main_thread(fn)()
 
 
-def _later(sec, fn, *args):
-    t = threading.Timer(sec, _main, args=(fn,) + args)
-    t.daemon = True
-    t.start()
+def _later(sec, fn):
+    """sec 秒後にメインスレッドで fn() を呼ぶ。
+    引数を付けて on_main_thread に渡すと Pythonista では ArgumentError やクラッシュになったため、
+    引数は渡さず、必要な値はオブジェクトに持たせておく。"""
+    import ui
+    ui.delay(fn, sec)
 
 
 _BT_STATE = {0: "不明", 1: "リセット中", 2: "非対応", 3: "許可されていません", 4: "オフ", 5: "オン"}
@@ -614,6 +618,8 @@ class BleSender(_BleBase):
         self.ready = False
         self.data_char = None
         self.job = None
+        self._timeout_job = None
+        self._central = None     # 接続して通知を待っている iPhone
         self._pct = 0
 
     # --- BLE に依存しない部分
@@ -647,9 +653,12 @@ class BleSender(_BleBase):
             self.finish(text.startswith("OK"), text[3:].strip() if text[:2] in ("OK", "NG") else text)
 
     def finish(self, ok, msg):
+        """送信を終える。アドバタイズを止め、BLE の準備（サービス）は残して次の「送信」に備える。"""
         self.job = None
+        self._timeout_job = None
         if self.pm is not None:
             self.pm.stopAdvertising()
+        self.on_log("送信を終了しました（%s）。次の「送信」を待っています" % ("成功" if ok else "失敗"))
         self.on_done(ok, msg)
 
     # --- BLE
@@ -676,21 +685,36 @@ class BleSender(_BleBase):
             raise RuntimeError("送信中です。終わるまでお待ちください")
         if not 0 < len(data) <= MAX_SIZE:
             raise ValueError("サイズが不正です（%d バイト）" % len(data))
-        job = self.job = {"name": name, "data": data, "fmt": fmt}
+        job = self.job = {"name": name, "data": data, "fmt": fmt, "timeout": timeout}
         _main(self._go)
-        _later(timeout, self._timeout, job, timeout)
+        self._timeout_job = job
+        _later(timeout, self._check_timeout)
 
     def _ready(self):
         self.pump(self._notify)
 
     def _go(self):
-        if self.ready:
-            self._advertise()
-        else:
+        if not self.ready:
             self.on_log("Bluetooth の準備を待っています…")
+        elif self._central is not None:   # iPhone がもう接続して待っている
+            self._start_job(self._central)
+        else:
+            self._advertise()
 
-    def _timeout(self, job, sec):
-        if self.job is job:
+    def _start_job(self, central):
+        if not self.job or "packets" in self.job:
+            return
+        try:
+            self.begin(int(central.maximumUpdateValueLength()))
+        except Exception as e:
+            self.finish(False, str(e))
+            return
+        self.pump(self._notify)
+
+    def _check_timeout(self):
+        job = self._timeout_job
+        if job is not None and self.job is job:
+            sec = job["timeout"]
             if "packets" in job:
                 self.finish(False, "iPhone から受信の確認が届きませんでした（%d 秒）" % sec)
             else:
@@ -738,20 +762,20 @@ class BleSender(_BleBase):
         self.on_log("iPhone の接続を待っています…（BLE）")
 
     def _subscribed(self, central, ch):
-        if _uuid_of(ch) != DATA_UUID or not self.job or "packets" in self.job:
+        if _uuid_of(ch) != DATA_UUID:
             return
-        try:
-            self.begin(int(central.maximumUpdateValueLength()))
-        except Exception as e:
-            self.finish(False, str(e))
-            return
-        self.pump(self._notify)
+        self._central = central
+        if self.job:
+            self._start_job(central)
+        else:
+            self.on_log("iPhone が接続しました。「送信」を押すと送ります")
 
     def _notify(self, pkt):
         from objc_util import ns
         return bool(self.pm.updateValue_forCharacteristic_onSubscribedCentrals_(ns(pkt), self.data_char, None))
 
     def _unsubscribed(self):
+        self._central = None
         if self.job and "packets" in self.job:
             self.finish(False, "送信の途中で iPhone との接続が切れました")
 
@@ -784,6 +808,11 @@ class BleReceiver(_BleBase):
         self._pct = 0
         self._wide = False
         self._scan_no = 0
+        self._wide_no = 0
+        self._wide_block = 0.0   # この時刻までは名前で探さない
+        self._watch = None
+        self.received = 0        # 受信できたファイルの数
+        self._just_done = False  # 受信を終えて切断するところ
 
     # --- BLE に依存しない部分
     def receive(self, pkt):
@@ -815,6 +844,8 @@ class BleReceiver(_BleBase):
             self.on_log("保存に失敗: %s" % e)
             return ("NG 保存に失敗 %s" % e).encode("utf-8")[:ACK_MAX]
         self.on_log("受信 %s（%d バイト、BLE）" % (os.path.basename(path), len(data)))
+        self.received += 1
+        self._just_done = True
         self._done = (path, fmt)
         return ("OK %s" % os.path.basename(path)).encode("utf-8")[:ACK_MAX]
 
@@ -852,11 +883,18 @@ class BleReceiver(_BleBase):
             self._scan_no += 1
             no = self._scan_no
             self.cm.scanForPeripheralsWithServices_options_(ns([_uuid(SERVICE_UUID)]), None)
-            _later(WIDE_SCAN_AFTER, self._wide_scan, no)
+            # 名前で探すのは、まだ一度も受信していないときだけ（受信後は iPad 本体が名前で見え続けるため）
+            if self.received == 0 and time.time() >= self._wide_block:
+                self._wide_no = no
+                _later(WIDE_SCAN_AFTER, self._check_wide)
+
+    def _check_wide(self):
+        self._wide_scan(self._wide_no)
 
     def _wide_scan(self, no):
         """サービス UUID で見つからないとき、名前（IPAD_NAMES）でも探す。"""
-        if no != self._scan_no or not self.running or self.cm is None or self.per is not None:
+        if (no != self._scan_no or not self.running or self.cm is None or self.per is not None
+                or self.received):
             return
         self._wide = True
         self.cm.stopScan()
@@ -885,10 +923,12 @@ class BleReceiver(_BleBase):
         p.setDelegate_(self.delegate)
         self.on_log("iPad を見つけました（%s）。接続しています…" % (p.name() or BLE_NAME))
         self.cm.connectPeripheral_options_(p, None)
-        _later(CONNECT_TIMEOUT, self._watchdog, p)
+        self._watch = p
+        _later(CONNECT_TIMEOUT, self._check_watchdog)
 
-    def _watchdog(self, p):
-        if self.per is p and self.data_char is None and not self.asm.active and self.cm is not None:
+    def _check_watchdog(self):
+        p, self._watch = self._watch, None
+        if p is not None and self.per is p and self.data_char is None and not self.asm.active and self.cm is not None:
             self.on_log("iPad から応答がないため、探し直します")
             self.cm.cancelPeripheralConnection_(p)
 
@@ -901,7 +941,9 @@ class BleReceiver(_BleBase):
             if _uuid_of(svc) == SERVICE_UUID:
                 p.discoverCharacteristics_forService_(None, svc)
                 return
-        self.on_log("%s には ECG 送信のサービスがありません。iPad で「送信」を押してください" % (p.name() or "機器"))
+        self.on_log("%s は送信の準備ができていません（iPad で ecg_sender_ipad.py を起動してください）"
+                    % (p.name() or "機器"))
+        self._wide_block = time.time() + 60   # しばらく名前では探さない（つないでは切る、を繰り返さないため）
         self.cm.cancelPeripheralConnection_(p)
 
     def _chars(self, p, svc):
@@ -949,8 +991,11 @@ class BleReceiver(_BleBase):
     def _lost(self, why):
         if self.asm.active:
             self.on_log("受信の途中で iPad との接続が切れました")
+        elif self._just_done:
+            self.on_log("受信完了（%d 件目）。iPad の次の「送信」を待っています" % self.received)
         elif why:
             self.on_log(why)
+        self._just_done = False
         self.asm.reset()
         self.per = None
         self.data_char = self.ack_char = None
