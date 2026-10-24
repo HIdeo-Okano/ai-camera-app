@@ -1,5 +1,7 @@
 # iPhone → iPad CSV 転送 (BLE / Pythonista)
 
+> **旧版です。** 現在は iPad → iPhone 方向の [`../ecg_ble/`](../ecg_ble/README.md)（`ecg_sender_ipad.py` / `ecg_viewer_iphone.py`）を使います。
+
 iPhone の **iCloud Drive 直下** に保存された `ECGtsHDdata1.csv` を、Bluetooth Low Energy (BLE) で iPad の **「ダウンロード」フォルダー** に転送します。
 
 | 役割 | 端末 | スクリプト | BLE の役割 |
