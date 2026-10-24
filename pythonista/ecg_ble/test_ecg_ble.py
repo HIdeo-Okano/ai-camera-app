@@ -596,6 +596,7 @@ class CoreBluetoothFlowTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         for mod in (tx, rx):
             mod.TRACE_DIR = self.tmp
+            mod._OLD_TRACE_DIR = self.tmp
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
@@ -648,11 +649,13 @@ class CoreBluetoothFlowTest(unittest.TestCase):
     def test_previous_trace_shown_on_start(self):
         with open(os.path.join(self.tmp, "ecg_ble_trace_sender.txt"), "w", encoding="utf-8") as f:
             f.write("ECG BLE 動作記録\n12:00:00 objc startAdvertising:\n12:00:01 objc updateValue:forCharacteristic:onSubscribedCentrals:\n")
-        W[0] = World()
         logs = []
-        snd = tx.core.BleSender(lambda m: logs.append(m), None)
-        snd.start()
+        tx.core.show_previous_trace("sender", logs.append)
         self.assertTrue(any("前回 12:00:01 objc updateValue" in m for m in logs), "\n".join(logs))
+        # 新しく記録を始めると、前回の記録は _prev.txt に残る
+        W[0] = World()
+        tx.core.BleSender(None, None).start()
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "ecg_ble_trace_sender_prev.txt")))
 
     def test_end_sequence(self):
         logs = self.flow(True)
