@@ -9,15 +9,18 @@
 #     iPad   … 応答を受け取ったらアドバタイズを止め、BLE の準備は残したまま次の「送信」を待つ
 #   ※ Pythonista の cb モジュールは使わない（Pythonista 3.4 では書き込みが PY_SSIZE_T_CLEAN エラーになる）。
 #     CoreBluetooth は下の _send() で直接呼ぶ（objc_util のメソッド呼び出しは使わない。理由は _send の上）。
-#   ※ CoreBluetooth の操作はすべてメインスレッドで行う
-#     （デリゲート・ui.delay の予約・ボタンの action はメインスレッドで動く）
+#   ※ iPad（送信）は CoreBluetooth の操作を専用の作業スレッドで行い、iOS からの通知（メインスレッド）は
+#     値を取り出して作業スレッドへ渡すだけにする（ble_diag_ipad.py で、iPhone が接続しても落ちなかった形）。
+#     iPhone（受信）は CoreBluetooth の操作をメインスレッドで行う（デリゲート・ui.delay の予約）。
+import queue
+import threading
 import zlib
 
 SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
 BLE_NAME = "ECG-TX"
-BLE_VERSION = "2026-10-25 r16"     # 起動時に表示（どのファイルが動いているか確かめるため）
+BLE_VERSION = "2026-10-25 r17"     # 起動時に表示（どのファイルが動いているか確かめるため）
 # 受信側（iPhone）はサービス UUID だけで iPad を探す（iPad の端末名は使わない）。
 # 名前で全機器を探す処理（サービスを指定しないスキャン）は、Pythonista で
 # ArgumentError になり、iPad 本体に何度もつなぎ直す原因にもなったため使わない。
@@ -283,6 +286,10 @@ def _trace_last(role, n=25):
         return []
 
 
+def _fault_path(role):
+    return os.path.join(TRACE_DIR, "ecg_ble_fault_%s.txt" % role)
+
+
 def show_previous_trace(role, log):
     """前回の動作記録を画面に出す。BLE を始める前に呼ぶ（始めてすぐ落ちても見えるように）。"""
     last = _trace_last(role)
@@ -290,6 +297,16 @@ def show_previous_trace(role, log):
         log("―― 前回の動作記録（最後の %d 行。前回落ちた場合は最後の行が落ちる直前の処理）――" % len(last))
         for ln in last:
             log("  前回 " + ln)
+        log("―― ここまで ――")
+    try:
+        with open(_fault_path(role), encoding="utf-8", errors="replace") as f:
+            fault = [ln for ln in f.read().splitlines() if ln.strip()]
+    except OSError:
+        fault = []
+    if fault:
+        log("―― 前回落ちた時の Python の位置（このスクリーンショットも送ってください）――")
+        for ln in fault[:40]:
+            log("  " + ln)
         log("―― ここまで ――")
 
 
@@ -305,6 +322,16 @@ def _trace_start(role):
             f.write("ECG BLE 動作記録（%s・版 %s）\n" % (role, BLE_VERSION))
     except Exception:
         _TRACE["path"] = None
+    # iOS の中で落ちた時に、その時動いていた Python の場所（全スレッド）をファイルに残す
+    try:
+        import faulthandler
+        if _TRACE.get("fault"):
+            faulthandler.disable()
+            _TRACE["fault"].close()
+        _TRACE["fault"] = open(_fault_path(role), "w")
+        faulthandler.enable(_TRACE["fault"], all_threads=True)
+    except Exception:
+        _TRACE["fault"] = None
 
 
 def _trace(msg):
@@ -362,31 +389,31 @@ def _dispatch(role, name, *ptrs):
 
 # 送信側（iPad：ペリフェラル）
 def peripheralManagerDidUpdateState_(_self, _cmd, pm):
-    _dispatch("sender", "_state", pm)
+    _dispatch("sender", "_cb_state", pm)
 
 
 def peripheralManager_didAddService_error_(_self, _cmd, pm, svc, err):
-    _dispatch("sender", "_added", err)
+    _dispatch("sender", "_cb_added", err)
 
 
 def peripheralManagerDidStartAdvertising_error_(_self, _cmd, pm, err):
-    _dispatch("sender", "_advertising", err)
+    _dispatch("sender", "_cb_advertising", err)
 
 
 def peripheralManager_central_didSubscribeToCharacteristic_(_self, _cmd, pm, central, ch):
-    _dispatch("sender", "_subscribed", central, ch)
+    _dispatch("sender", "_cb_subscribed", central, ch)
 
 
 def peripheralManager_central_didUnsubscribeFromCharacteristic_(_self, _cmd, pm, central, ch):
-    _dispatch("sender", "_unsubscribed")
+    _dispatch("sender", "_cb_unsubscribed")
 
 
 def peripheralManagerIsReadyToUpdateSubscribers_(_self, _cmd, pm):
-    _dispatch("sender", "_ready")
+    _dispatch("sender", "_cb_ready")
 
 
 def peripheralManager_didReceiveWriteRequests_(_self, _cmd, pm, reqs):
-    _dispatch("sender", "_writes", reqs)
+    _dispatch("sender", "_cb_writes", reqs)
 
 
 # 受信側（iPhone：セントラル）
@@ -470,20 +497,30 @@ class BleSender(_BleBase):
     """送信側（iPad）。send() でアドバタイズし、接続してきた iPhone へ Notify で送る。
 
     on_done(ok, msg) … 送信結果。ok=True なら msg は iPhone 側の保存名、False なら失敗の理由。
+    on_log・on_done は作業スレッドから呼ばれる（画面の部品は直接さわらないこと）。
+
+    CoreBluetooth の操作は専用の作業スレッドで行う。iOS からの通知（メインスレッド）は、必要な値を
+    取り出して作業スレッドへ渡すだけにする。iPad の診断（ble_diag_ipad.py）はこの形で、iPhone が
+    接続しても落ちなかった。r16 まではメインスレッドで全部行い、iPhone の接続時に iPad が落ちた。
+    threaded=False にすると、作業スレッドを使わずその場で処理する（PC での確認用）。
     """
 
-    def __init__(self, on_log=None, on_done=None):
+    def __init__(self, on_log=None, on_done=None, threaded=True):
         self._set_log(on_log)
         self.on_done = on_done or (lambda ok, msg: None)
         self.pm = None
+        self.delegate = None
         self.ready = False
         self.data_char = None
         self._ack_char = None    # サービスと特性は iOS が使い続けるので、閉じるまで手放さない
         self._svc = None
         self.job = None
-        self._timeout_job = None
+        self._deadline = None    # この時刻までに終わらなければ失敗にする
         self._central = None     # 接続して通知を待っている iPhone
         self._pct = 0
+        self._threaded = threaded
+        self._events = queue.Queue()
+        self._thread = None
 
     # --- BLE に依存しない部分
     def begin(self, chunk):
@@ -521,7 +558,7 @@ class BleSender(_BleBase):
         """送信を終える。アドバタイズを止め、BLE の準備（サービス）は残して次の「送信」に備える。"""
         _trace("finish %s" % ok)
         self.job = None
-        self._timeout_job = None
+        self._deadline = None
         if self.pm:
             _send(self.pm, "stopAdvertising", "v")
             _trace("finish: stopAdvertising done")
@@ -529,15 +566,104 @@ class BleSender(_BleBase):
         self.on_done(ok, msg)
         _trace("finish: on_done done")
 
-    # --- BLE
+    # --- 作業スレッド
     def start(self):
+        """BLE を始める（画面から呼ぶ）。"""
         _trace_start("sender")
         self.on_log("BLE 送信を開始します（版 %s）" % BLE_VERSION)
         _ACTIVE["sender"] = self
+        if self._threaded:
+            self._thread = threading.Thread(target=self._run, name="ECGBleSender")
+            self._thread.daemon = True
+            self._thread.start()
+        else:
+            self._post("open")
+
+    def _run(self):
+        _trace("worker: start")
+        self._try(self._handle, ("open",))
+        while True:
+            try:
+                ev = self._events.get(timeout=0.5)
+            except queue.Empty:
+                ev = ("tick",)
+            self._try(self._handle, ev)
+            if ev[0] == "close":
+                break
+        _trace("worker: end")
+
+    def _post(self, *ev):
+        """作業スレッドに処理を頼む。"""
+        if self._threaded:
+            self._events.put(ev)
+        else:
+            self._try(self._handle, ev)
+
+    def _handle(self, ev):
+        if ev[0] != "tick":
+            _trace("work %s" % ev[0])
+        getattr(self, "_do_" + ev[0])(*ev[1:])
+
+    def stop(self):
+        """画面を閉じる時に呼ぶ。作業スレッドで後片付けして、終わるのを少し待つ。"""
+        self.job = None
+        self._post("close")
+        if self._thread is not None:
+            self._thread.join(3)
+            self._thread = None
+        if _ACTIVE.get("sender") is self:
+            del _ACTIVE["sender"]
+
+    def send(self, name, data, fmt="4", timeout=SEND_TIMEOUT):
+        """画面の「送信」から呼ぶ。実際の送信は作業スレッドで行う。"""
+        if self.job:
+            raise RuntimeError("送信中です。終わるまでお待ちください")
+        if not 0 < len(data) <= MAX_SIZE:
+            raise ValueError("サイズが不正です（%d バイト）" % len(data))
+        self.job = {"name": name, "data": data, "fmt": fmt, "timeout": timeout}
+        self._post("send")
+
+    # --- iOS からの通知（メインスレッド）。値を取り出して作業スレッドへ渡すだけにする
+    def _cb_state(self, pm):
+        self._post("state", _send(pm, "state", "q"))
+
+    def _cb_added(self, err):
+        self._post("added", (_err_text(err) or "エラー") if err else None)
+
+    def _cb_advertising(self, err):
+        self._post("advertising", (_err_text(err) or "エラー") if err else None)
+
+    def _cb_subscribed(self, central, ch):
+        if _uuid_of(ch) == DATA_UUID:
+            self._post("subscribed", _retain(central))   # 作業スレッドが受け取るまで手放さない
+
+    def _cb_unsubscribed(self):
+        self._post("unsubscribed")
+
+    def _cb_ready(self):
+        self._post("ready")
+
+    def _cb_writes(self, reqs):
+        """書き込み（iPhone からの応答）は、ここで中身を読んで iOS に返事をする（要求は通知の間だけ有効）。"""
+        items = _items(reqs)
+        _trace("writes: %d" % len(items))
+        texts = []
+        for r in items:
+            if _uuid_of(_send(r, "characteristic", "@")) == ACK_UUID:
+                texts.append(_bytes_of(_send(r, "value", "@")).decode("utf-8", "replace"))
+        _trace("writes: read %r" % texts)
+        if items:
+            _send(self.pm, "respondToRequest:withResult:", "v@q", items[0], 0)
+            _trace("writes: responded")
+        for t in texts:
+            self._post("ack", t)
+
+    # --- 作業スレッドで行う処理
+    def _do_open(self):
         self.delegate = _delegate("ECGBleSender", _SENDER_METHODS, ["CBPeripheralManagerDelegate"])
         self.pm = _new("CBPeripheralManager", "initWithDelegate:queue:", "@@@", _ptr_of(self.delegate), None)
 
-    def stop(self):
+    def _do_close(self):
         self.job = None
         if self.pm:
             _send(self.pm, "stopAdvertising", "v")
@@ -550,30 +676,32 @@ class BleSender(_BleBase):
         self.data_char = self._ack_char = self._svc = None
         _release(self._central)
         self._central = None
-        if _ACTIVE.get("sender") is self:
-            del _ACTIVE["sender"]
 
-    def send(self, name, data, fmt="4", timeout=SEND_TIMEOUT):
-        """メインスレッドから呼ぶ。"""
-        if self.job:
-            raise RuntimeError("送信中です。終わるまでお待ちください")
-        if not 0 < len(data) <= MAX_SIZE:
-            raise ValueError("サイズが不正です（%d バイト）" % len(data))
-        self.job = {"name": name, "data": data, "fmt": fmt, "timeout": timeout}
-        self._go()   # send() はメインスレッド（ボタンの action）から呼ぶこと
-
-    def _ready(self):
-        self.pump(self._notify)
-
-    def _go(self):
-        self._timeout_job = self.job
-        _later(self.job["timeout"], self._check_timeout)
-        if not self.ready:
+    def _do_send(self):
+        if not self.job:
+            return
+        self._deadline = time.time() + self.job["timeout"]
+        if not self.pm or not self.ready:
             self.on_log("Bluetooth の準備を待っています…")
-        elif self._central:   # iPhone がもう接続して待っている
+        else:
+            self._kick()
+
+    def _kick(self):
+        if self._central:   # iPhone がもう接続して待っている
             self._start_job(self._central)
         else:
             self._advertise()
+
+    def _do_tick(self):
+        job = self.job
+        if job is None or self._deadline is None or time.time() < self._deadline:
+            return
+        sec = job["timeout"]
+        if "packets" in job:
+            self.finish(False, "iPhone から受信の確認が届きませんでした（%d 秒）" % sec)
+        else:
+            self.finish(False, "iPhone が見つかりませんでした（%d 秒）。iPhone で ecg_viewer_iphone.py が"
+                               "起動しているか確認してください" % sec)
 
     def _start_job(self, central):
         if not self.job or "packets" in self.job:
@@ -585,18 +713,9 @@ class BleSender(_BleBase):
             return
         self.pump(self._notify)
 
-    def _check_timeout(self):
-        job = self._timeout_job
-        if job is not None and self.job is job:
-            sec = job["timeout"]
-            if "packets" in job:
-                self.finish(False, "iPhone から受信の確認が届きませんでした（%d 秒）" % sec)
-            else:
-                self.finish(False, "iPhone が見つかりませんでした（%d 秒）。iPhone で ecg_viewer_iphone.py が"
-                                   "起動しているか確認してください" % sec)
-
-    def _state(self, pm):
-        st = _send(pm, "state", "q")
+    def _do_state(self, st):
+        if not self.pm:
+            return
         self.on_log("Bluetooth: %s" % _BT_STATE.get(st, st))
         if st != 5:
             self.ready = False
@@ -610,22 +729,22 @@ class BleSender(_BleBase):
                         _uuid(ACK_UUID), 0x08, None, 0x02)              # Write / Writeable
         svc = _new("CBMutableService", "initWithType:primary:", "@@B", _uuid(SERVICE_UUID), True)
         _send(svc, "setCharacteristics:", "v@", _nsarray([data_char, ack_char]))
-        _send(pm, "removeAllServices", "v")
-        _send(pm, "addService:", "v@", svc)
+        _send(self.pm, "removeAllServices", "v")
+        _send(self.pm, "addService:", "v@", svc)
         # 登録したサービス・特性は手放さない（r12 では登録直後に手放したため、iPhone が中身を
         # 確かめに来た時に解放済みになり、サービスが見えないうえ iPad が落ちた）
         self.data_char, self._ack_char, self._svc = data_char, ack_char, svc
         for p in old:   # 前に登録していたものは removeAllServices で外したので手放してよい
             _release(p)
 
-    def _added(self, err):
+    def _do_added(self, err):
         if err:
-            self.on_log("BLE サービスの登録に失敗: %s" % _err_text(err))
+            self.on_log("BLE サービスの登録に失敗: %s" % err)
             return
         self.ready = True
         self.on_log("BLE の準備ができました")
         if self.job:
-            self._advertise()
+            self._kick()
 
     def _advertise(self):
         _send(self.pm, "stopAdvertising", "v")
@@ -633,46 +752,38 @@ class BleSender(_BleBase):
                        (_nsstr("kCBAdvDataServiceUUIDs"), _nsarray([_uuid(SERVICE_UUID)]))])
         _send(self.pm, "startAdvertising:", "v@", adv)
 
-    def _advertising(self, err):
+    def _do_advertising(self, err):
         if err:
             if self.job:
-                self.finish(False, "アドバタイズを開始できません: %s" % _err_text(err))
+                self.finish(False, "アドバタイズを開始できません: %s" % err)
             return
         self.on_log("iPhone の接続を待っています…（BLE）")
 
-    def _subscribed(self, central, ch):
-        if _uuid_of(ch) != DATA_UUID:
-            return
+    def _do_subscribed(self, central):
         _release(self._central)
-        self._central = _retain(central)
+        self._central = central   # _cb_subscribed で retain 済み
+        if not self.pm:
+            return
         if self.job:
             self._start_job(central)
         else:
             self.on_log("iPhone が接続しました。「送信」を押すと送ります")
 
-    def _notify(self, pkt):
-        return bool(_send(self.pm, "updateValue:forCharacteristic:onSubscribedCentrals:", "B@@@",
-                          _nsdata(pkt), self.data_char, None))
-
-    def _unsubscribed(self):
+    def _do_unsubscribed(self):
         _release(self._central)
         self._central = None
         if self.job and "packets" in self.job:
             self.finish(False, "送信の途中で iPhone との接続が切れました")
 
-    def _writes(self, reqs):
-        items = _items(reqs)
-        _trace("writes: %d" % len(items))
-        texts = []
-        for r in items:
-            if _uuid_of(_send(r, "characteristic", "@")) == ACK_UUID:
-                texts.append(_bytes_of(_send(r, "value", "@")).decode("utf-8", "replace"))
-        _trace("writes: read %r" % texts)
-        if items:
-            _send(self.pm, "respondToRequest:withResult:", "v@q", items[0], 0)
-            _trace("writes: responded")
-        for t in texts:
-            self.ack(t)
+    def _do_ready(self):
+        self.pump(self._notify)
+
+    def _do_ack(self, text):
+        self.ack(text)
+
+    def _notify(self, pkt):
+        return bool(_send(self.pm, "updateValue:forCharacteristic:onSubscribedCentrals:", "B@@@",
+                          _nsdata(pkt), self.data_char, None))
 
 
 class BleReceiver(_BleBase):

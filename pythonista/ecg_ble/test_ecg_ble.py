@@ -605,7 +605,8 @@ class CoreBluetoothFlowTest(unittest.TestCase):
     def flow(self, iphone_first, full_every=0, hide_service=False):
         W[0] = World(full_every, hide_service)
         logs, done, files = [], [], []
-        snd = tx.core.BleSender(lambda m: logs.append("iPad: " + m), lambda ok, msg: done.append((ok, msg)))
+        snd = tx.core.BleSender(lambda m: logs.append("iPad: " + m), lambda ok, msg: done.append((ok, msg)),
+                                threaded=False)
         rcv = rx.core.BleReceiver(self.tmp, lambda p, f: files.append((p, f)), lambda m: logs.append("iPhone: " + m))
         name, raw = sample_csv()
         if iphone_first:
@@ -642,20 +643,30 @@ class CoreBluetoothFlowTest(unittest.TestCase):
         with open(os.path.join(self.tmp, "ecg_ble_trace_sender.txt"), encoding="utf-8") as f:
             trace = f.read()
         self.assertIn(tx.core.BLE_VERSION, trace)
-        for step in ("> _subscribed", "notify 1/", "> _writes", "writes: responded", "finish True",
+        for step in ("> _cb_subscribed", "work subscribed", "notify 1/", "> _cb_writes", "writes: responded",
+                     "work ack", "finish True",
                      "finish: on_done done"):
             self.assertIn(step, trace)
 
     def test_previous_trace_shown_on_start(self):
         with open(os.path.join(self.tmp, "ecg_ble_trace_sender.txt"), "w", encoding="utf-8") as f:
             f.write("ECG BLE 動作記録\n12:00:00 objc startAdvertising:\n12:00:01 objc updateValue:forCharacteristic:onSubscribedCentrals:\n")
+        with open(os.path.join(self.tmp, "ecg_ble_fault_sender.txt"), "w", encoding="utf-8") as f:
+            f.write("Fatal Python error: Segmentation fault\n\nThread 0x01 (most recent call first):\n"
+                    "  File \"ecg_sender_ipad.py\", line 9 in _notify\n")
         logs = []
         tx.core.show_previous_trace("sender", logs.append)
         self.assertTrue(any("前回 12:00:01 objc updateValue" in m for m in logs), "\n".join(logs))
-        # 新しく記録を始めると、前回の記録は _prev.txt に残る
+        # 前回 iOS の中で落ちた時の Python の位置（faulthandler の記録）も出す
+        self.assertTrue(any("前回落ちた時" in m for m in logs), "\n".join(logs))
+        self.assertTrue(any("line 9 in _notify" in m for m in logs), "\n".join(logs))
+        # 新しく記録を始めると、前回の記録は _prev.txt に残り、落ちた位置の記録は空にする
         W[0] = World()
-        tx.core.BleSender(None, None).start()
+        tx.core.BleSender(None, None, threaded=False).start()
         self.assertTrue(os.path.exists(os.path.join(self.tmp, "ecg_ble_trace_sender_prev.txt")))
+        logs = []
+        tx.core.show_previous_trace("sender", logs.append)
+        self.assertFalse(any("前回落ちた時" in m for m in logs), "\n".join(logs))
 
     def test_end_sequence(self):
         logs = self.flow(True)
@@ -667,7 +678,8 @@ class CoreBluetoothFlowTest(unittest.TestCase):
         self.assertIsNone(self.rcv.per)
         # 時間がたっても（タイムアウト・接続確認）何も起きない
         n = len(logs)
-        w.fire("_check_timeout")
+        self.snd._deadline = 0
+        self.snd._post("tick")
         w.fire("_check_watchdog")
         self.assertEqual(self.done, [(True, sample_csv()[0])])
         self.assertEqual([m for m in logs[n:] if "エラー" in m or "失敗" in m], [], "\n".join(logs))
@@ -683,6 +695,82 @@ class CoreBluetoothFlowTest(unittest.TestCase):
         W[0].on_main(snd.send, name, raw, "4")   # ボタンの action（メインスレッド）
         W[0].run()
         self.assertEqual(done, [(True, name)], "\n".join(logs))
+
+
+    def test_timeout_when_no_iphone(self):
+        W[0] = World()
+        logs, done = [], []
+        snd = tx.core.BleSender(logs.append, lambda ok, msg: done.append((ok, msg)), threaded=False)
+        snd.start()
+        W[0].run()
+        W[0].on_main(snd.send, "a.csv", b"1,2\n", "4")
+        W[0].run()
+        self.assertTrue(W[0].advertising)
+        snd._post("tick")                 # まだ時間内
+        self.assertEqual(done, [])
+        snd._deadline = 0                 # 時間切れにする
+        snd._post("tick")
+        self.assertEqual(len(done), 1)
+        self.assertFalse(done[0][0])
+        self.assertIn("見つかりませんでした", done[0][1])
+        self.assertFalse(W[0].advertising)
+        self.assertIsNone(snd.job)
+
+    def test_flow_with_worker_thread(self):
+        """iPad の送信は、CoreBluetooth の操作を作業スレッドで行う（ble_diag_ipad.py で、iPhone が
+        接続しても落ちなかった形）。iOS からの通知（メインスレッド）は値を渡すだけ。"""
+        import threading
+        import time
+        W[0] = World()
+        seen = []
+        real = tx._send
+
+        def rec(obj, sel, sig, *args):
+            seen.append((threading.current_thread().name, sel))
+            return real(obj, sel, sig, *args)
+        tx._send = rec
+        logs, done, files = [], [], []
+        name, raw = sample_csv()
+
+        def until(cond, sec=20):
+            end = time.time() + sec
+            while time.time() < end:
+                W[0].run()
+                if cond():
+                    return
+                time.sleep(0.005)
+            self.fail("\n".join(logs))
+        try:
+            snd = tx.core.BleSender(lambda m: logs.append("iPad: " + m), lambda ok, msg: done.append((ok, msg)))
+            rcv = rx.core.BleReceiver(self.tmp, lambda p, f: files.append((p, f)),
+                                      lambda m: logs.append("iPhone: " + m))
+            rcv.start()
+            W[0].run()
+            snd.start()
+            until(lambda: snd.ready)
+            W[0].on_main(snd.send, name, raw, "4")   # 画面の「送信」（メインスレッド）
+            until(lambda: done)
+            snd.stop()
+        finally:
+            tx._send = real
+        self.assertEqual(done, [(True, name)], "\n".join(logs))
+        with open(files[0][0], "rb") as f:
+            self.assertEqual(f.read(), raw)
+        self.assertIsNone(snd._thread)              # 閉じると作業スレッドも終わる
+        self.assertIsNone(snd.pm)
+        work = {"initWithDelegate:queue:", "addService:", "removeAllServices", "startAdvertising:",
+                "stopAdvertising", "updateValue:forCharacteristic:onSubscribedCentrals:", "setDelegate:"}
+        self.assertTrue(work <= {sel for th, sel in seen}, seen)
+        self.assertEqual([(th, sel) for th, sel in seen if sel in work and th != "ECGBleSender"], [])
+
+    def test_sender_ui_does_not_use_ui_delay(self):
+        """iPad の画面は ui.delay を使わず、update() でほかのスレッドからの記録・結果を画面に出す。"""
+        with open(tx.__file__, encoding="utf-8") as f:
+            src = f.read()
+        ui_part = src[src.index("# ==================== 共通処理ここまで"):]
+        self.assertNotIn("ui.delay(", ui_part)
+        self.assertIn("def update(self):", ui_part)
+        self.assertIn("update_interval", ui_part)
 
 
 def gc_objs():
