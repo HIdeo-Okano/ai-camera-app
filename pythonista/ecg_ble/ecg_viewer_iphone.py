@@ -231,7 +231,7 @@ def _status_int(tok):
 
 def parse_csv(text, fmt="auto"):
     """CSV テキストを読む。fmt は "auto"／"4"（4行ヘッダ）／"2"（2行ヘッダ）。"""
-    if text.startswith("﻿"):
+    if text.startswith("\ufeff"):
         text = text[1:]
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not lines:
