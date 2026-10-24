@@ -14,7 +14,23 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOG = os.path.join(HERE, "ble_diag_ipad_log.txt")
+
+
+def _log_path():
+    """記録ファイルの場所。「ファイル」アプリから開いたスクリプトは、そのフォルダーに書き込めない
+    （PermissionError）ので、そのときは Pythonista 自身の Documents に置く。"""
+    for d in (HERE, os.path.expanduser("~/Documents")):
+        path = os.path.join(d, "ble_diag_ipad_log.txt")
+        try:
+            with open(path, "a", encoding="utf-8"):
+                pass
+            return path
+        except OSError:
+            continue
+    return None
+
+
+LOG = _log_path()
 SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"
@@ -24,17 +40,21 @@ def write(msg):
     line = "%s %s" % (time.strftime("%H:%M:%S"), msg)
     print(line)
     sys.stdout.flush()
-    with open(LOG, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    if LOG:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
 
 def show_previous():
+    print("記録ファイル: %s" % LOG)
     try:
         with open(LOG, encoding="utf-8") as f:
             lines = f.read().splitlines()
-    except OSError:
+    except (OSError, TypeError):
+        lines = []
+    if not lines:
         print("（前回の記録はありません）")
         return
     print("========== 前回の記録（最後の行が、落ちる直前に行っていた段）==========")
@@ -126,8 +146,9 @@ def step(no, title, fn):
 
 def main():
     show_previous()
-    with open(LOG, "w", encoding="utf-8") as f:
-        f.write("BLE 診断の記録\n")
+    if LOG:
+        with open(LOG, "w", encoding="utf-8") as f:
+            f.write("BLE 診断の記録\n")
     write("iPad BLE 診断を始めます（Python %s）" % sys.version.split()[0])
     keep = {}
 
