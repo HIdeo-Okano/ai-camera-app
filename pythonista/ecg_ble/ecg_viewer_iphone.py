@@ -6,7 +6,8 @@ ecg_viewer.html（改修版）と同じ画面・動作を Pythonista 3 だけで
   横向き : 波形・電極状態・異常検知（6.2.2）
 
 データの受け取り方
-  1) iPad の送信プログラム（ecg_sender_ipad.py）から Wi-Fi で受信（自動で「データ検出」になる）
+  1) iPad の送信プログラム（ecg_sender_ipad.py）から BLE で受信（自動で「データ検出」になる）
+     iPad をサービス UUID で探して自動で接続する（Wi-Fi・IP アドレスの設定は不要）
      受信した CSV は Pythonista 3 の Downloads フォルダ（ファイルApp：このiPhone内 > Pythonista 3 > Downloads）に保存
   2) 「ファイル」ボタン → ファイルApp から選ぶ（AirDrop で受け取った「ダウンロード」フォルダ内の CSV など）
 
@@ -20,7 +21,6 @@ import ui
 import json
 import math
 import os
-import socket
 import time
 
 # ===== R波検出・R-R判定（rr_detect.c と同じ整数演算） =====
@@ -322,30 +322,25 @@ def analyze(d):
             "abn": abn, "hr": hr, "sec": sec, "lead_now": lead_now}
 
 
-# ===== iPad → iPhone 送受信（同じ Wi-Fi 内の TCP） =====
-#   送信： b"ECGF1\n" + JSON（name, size, fmt）+ b"\n" + CSV本体
-#   応答： b"OK <保存したファイル名>\n" または b"NG <理由>\n"
-TCP_PORT = 50505
-DISC_PORT = 50506          # 送信側が受信側を探す UDP（ブロードキャスト。使えない環境では IP を手入力）
-MAGIC = b"ECGF1\n"
-DISC_Q = b"ECGVIEW?"
-DISC_A = b"ECGVIEW1"
+# ===== iPad → iPhone 送受信（BLE） =====
+#   iPad（送信）  ＝ BLE ペリフェラル。「送信」を押すとアドバタイズし、接続してきた iPhone へ送る。
+#   iPhone（受信）＝ BLE セントラル。サービス UUID で iPad を探して自動で接続する（IP・端末名の設定は不要）。
+#   データ：DATA キャラクタリスティックの Notify（1通知＝1パケット）
+#     b"H" + JSON（name, size, crc, fmt）／ b"D" + 連番4バイト + データ ／ b"E"（終了）
+#   応答：iPhone が ACK キャラクタリスティックへ "OK <保存したファイル名>" または "NG <理由>" を書き込む
+#   ※ Pythonista の cb モジュールは使わない（Pythonista 3.4 では書き込みが PY_SSIZE_T_CLEAN エラーになる）。
+#     両側とも objc_util で CoreBluetooth を直接使う。
+import threading
+import zlib
+
+SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
+DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
+ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
+BLE_NAME = "ECG-TX"
 MAX_SIZE = 20 * 1024 * 1024
-
-
-def local_ip():
-    for probe in ("10.255.255.255", "192.168.255.255", "8.8.8.8"):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect((probe, 1))
-            ip = s.getsockname()[0]
-            if ip and not ip.startswith("0."):
-                return ip
-        except OSError:
-            pass
-        finally:
-            s.close()
-    return "127.0.0.1"
+SEND_TIMEOUT = 120       # 送信側：iPhone が接続してくるまで・確認が届くまでの待ち時間（秒）
+CONNECT_TIMEOUT = 15     # 受信側：接続してから受信が始まるまでの待ち時間（秒）
+ACK_MAX = 180
 
 
 def safe_name(name):
@@ -356,160 +351,511 @@ def safe_name(name):
     return base
 
 
-def _recv_line(conn, limit=4096):
-    buf = b""
-    while not buf.endswith(b"\n"):
-        c = conn.recv(1)
-        if not c:
-            raise ValueError("接続が切れました")
-        buf += c
-        if len(buf) > limit:
-            raise ValueError("ヘッダが長すぎます")
-    return buf
+def build_packets(name, data, fmt="4", chunk=182):
+    """送るパケットの列を作る。chunk は1通知の最大バイト数（iPhone 側の maximumUpdateValueLength）。"""
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+    stem, ext = os.path.splitext(os.path.basename(name or "data.csv"))
+    while True:  # ヘッダが1通知に収まるようファイル名を必要なら短くする
+        head = b"H" + json.dumps({"name": stem + ext, "size": len(data), "crc": crc, "fmt": fmt},
+                                 ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(head) <= chunk or not stem:
+            break
+        stem = stem[:-1]
+    if len(head) > chunk or chunk < 16:
+        raise ValueError("BLE の1回の送信サイズが小さすぎます（%d バイト）" % chunk)
+    pay = chunk - 5
+    pk = [head]
+    for i, p in enumerate(range(0, len(data), pay)):
+        pk.append(b"D" + i.to_bytes(4, "big") + data[p:p + pay])
+    pk.append(b"E")
+    return pk
 
 
-def _recv_exact(conn, n):
-    parts, got = [], 0
-    while got < n:
-        c = conn.recv(min(65536, n - got))
-        if not c:
-            raise ValueError("受信途中で切断されました（%d/%d バイト）" % (got, n))
-        parts.append(c)
-        got += len(c)
-    return b"".join(parts)
+class Assembler(object):
+    """受信したパケットを元のファイルに組み立てる。"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.meta = None
+        self.buf = bytearray()
+        self.seq = 0
+
+    @property
+    def active(self):
+        return self.meta is not None
+
+    def feed(self, pkt):
+        """1パケット処理する。ファイルがそろったら (name, data, fmt) を返す。"""
+        kind, body = pkt[:1], pkt[1:]
+        if kind == b"H":
+            self.reset()
+            m = json.loads(body.decode("utf-8"))
+            size = int(m.get("size", -1))
+            if not 0 < size <= MAX_SIZE:
+                raise ValueError("サイズが不正です（%s）" % size)
+            self.meta = m
+            return None
+        if self.meta is None:
+            raise ValueError("ヘッダを受け取る前にデータが届きました")
+        if kind == b"D":
+            if len(body) < 4 or int.from_bytes(body[:4], "big") != self.seq:
+                raise ValueError("データの順番が不正です（%d 番目）" % self.seq)
+            self.seq += 1
+            self.buf += body[4:]
+            if len(self.buf) > int(self.meta["size"]):
+                raise ValueError("宣言より多いデータを受け取りました")
+            return None
+        if kind == b"E":
+            m, data = self.meta, bytes(self.buf)
+            self.reset()
+            if len(data) != int(m["size"]):
+                raise ValueError("サイズが一致しません（%d/%d バイト）" % (len(data), int(m["size"])))
+            if zlib.crc32(data) & 0xFFFFFFFF != int(m.get("crc", -1)):
+                raise ValueError("CRC が一致しません（データ破損）")
+            return m.get("name"), data, str(m.get("fmt", "auto"))
+        raise ValueError("不明なパケットです")
 
 
-def send_file(host, name, data, fmt="4", port=TCP_PORT, timeout=10.0):
-    """CSV（bytes）を受信側へ送る。受信側が保存したファイル名を返す。"""
-    meta = json.dumps({"name": name, "size": len(data), "fmt": fmt}, ensure_ascii=False)
-    with socket.create_connection((host, port), timeout=timeout) as s:
-        s.sendall(MAGIC + meta.encode("utf-8") + b"\n" + data)
-        ans = _recv_line(s).decode("utf-8", "replace").strip()
-    if not ans.startswith("OK"):
-        raise IOError("受信側でエラー: " + ans)
-    return ans[3:].strip()
+# ----- CoreBluetooth（objc_util）
+_CB = {}
+_CLS_NO = [0]
 
 
-def discover(timeout=1.5):
-    """同じネットワークの受信側（iPhone）を UDP ブロードキャストで探す。[(ip, 名前)] を返す。"""
-    found = {}
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.settimeout(0.3)
-        for dst in ("255.255.255.255", "127.0.0.1"):
-            try:
-                s.sendto(DISC_Q, (dst, DISC_PORT))
-            except OSError:
-                pass
-        end = time.time() + timeout
-        while time.time() < end:
-            try:
-                data, addr = s.recvfrom(512)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if data.startswith(DISC_A):
-                found[addr[0]] = data[len(DISC_A):].decode("utf-8", "replace").strip()
-    finally:
-        s.close()
-    return sorted(found.items())
+def _cb(name):
+    if not _CB:
+        from objc_util import ObjCClass, load_framework
+        load_framework("CoreBluetooth")
+        for n in ("CBUUID", "CBPeripheralManager", "CBCentralManager", "CBMutableService",
+                  "CBMutableCharacteristic"):
+            _CB[n] = ObjCClass(n)
+    return _CB[name]
 
 
-class Receiver(object):
-    """受信サーバ（iPhone側）。受け取った CSV を save_dir に保存し on_file(path, fmt) を呼ぶ。"""
+def _uuid(s):
+    return _cb("CBUUID").UUIDWithString_(s)
 
-    def __init__(self, save_dir, on_file, on_log=None, name="iPhone", port=TCP_PORT):
+
+def _uuid_of(obj):
+    return str(obj.UUID().UUIDString()).upper()
+
+
+def _delegate(base, methods, protocols):
+    """デリゲートの ObjC クラスを作る（再実行しても名前が重ならないよう番号を付ける）。"""
+    from objc_util import create_objc_class
+    _CLS_NO[0] += 1
+    name = "%s_%d_%d" % (base, int(time.time()), _CLS_NO[0])
+    return create_objc_class(name, methods=methods, protocols=protocols).new()
+
+
+def _main(fn):
+    """CoreBluetooth の操作はメインスレッドで行う。"""
+    from objc_util import on_main_thread
+    on_main_thread(fn)()
+
+
+def _later(sec, fn):
+    t = threading.Timer(sec, lambda: _main(fn))
+    t.daemon = True
+    t.start()
+
+
+_BT_STATE = {0: "不明", 1: "リセット中", 2: "非対応", 3: "許可されていません", 4: "オフ", 5: "オン"}
+
+
+def _bt_hint(st):
+    if st == 3:
+        return "設定 → Pythonista → Bluetooth を ON にしてください"
+    if st == 4:
+        return "Bluetooth を ON にしてください（設定アプリ → Bluetooth）"
+    return ""
+
+
+class BleSender(object):
+    """送信側（iPad）。send() でアドバタイズし、接続してきた iPhone へ Notify で送る。
+
+    on_done(ok, msg) … 送信結果。ok=True なら msg は iPhone 側の保存名、False なら失敗の理由。
+    """
+
+    def __init__(self, on_log=None, on_done=None):
+        self.on_log = on_log or (lambda m: None)
+        self.on_done = on_done or (lambda ok, msg: None)
+        self.pm = None
+        self.ready = False
+        self.data_char = None
+        self.job = None
+        self._pct = 0
+
+    # --- BLE に依存しない部分
+    def begin(self, chunk):
+        j = self.job
+        j["packets"] = build_packets(j["name"], j["data"], j["fmt"], chunk)
+        j["i"] = 0
+        self._pct = 0
+        self.on_log("iPhone が接続しました。送信します（%d バイト / %d パケット）" % (len(j["data"]), len(j["packets"])))
+
+    def pump(self, notify):
+        """notify(bytes) が False（送信待ちがいっぱい）を返すまで送り続ける。"""
+        j = self.job
+        if not j or "packets" not in j:
+            return
+        pk = j["packets"]
+        while j["i"] < len(pk):
+            if not notify(pk[j["i"]]):
+                return  # 空きができたら peripheralManagerIsReadyToUpdateSubscribers から再開
+            j["i"] += 1
+            pct = j["i"] * 100 // len(pk)
+            if pct >= self._pct + 20:
+                self._pct = pct - pct % 20
+                self.on_log("  送信中… %d%%" % pct)
+        if not j.get("sent"):
+            j["sent"] = True
+            self.on_log("全データを送りました。iPhone の確認を待っています…")
+
+    def ack(self, text):
+        if self.job:
+            self.finish(text.startswith("OK"), text[3:].strip() if text[:2] in ("OK", "NG") else text)
+
+    def finish(self, ok, msg):
+        self.job = None
+        if self.pm is not None:
+            self.pm.stopAdvertising()
+        self.on_done(ok, msg)
+
+    # --- BLE
+    def start(self):
+        from objc_util import ObjCInstance, nsdata_to_bytes
+        s = self
+        self._bytes = nsdata_to_bytes
+
+        def peripheralManagerDidUpdateState_(_self, _cmd, pm):
+            s._state(ObjCInstance(pm))
+
+        def peripheralManager_didAddService_error_(_self, _cmd, pm, svc, err):
+            s._added(err)
+
+        def peripheralManagerDidStartAdvertising_error_(_self, _cmd, pm, err):
+            s._advertising(err)
+
+        def peripheralManager_central_didSubscribeToCharacteristic_(_self, _cmd, pm, central, ch):
+            s._subscribed(ObjCInstance(central), ObjCInstance(ch))
+
+        def peripheralManager_central_didUnsubscribeFromCharacteristic_(_self, _cmd, pm, central, ch):
+            s._unsubscribed()
+
+        def peripheralManagerIsReadyToUpdateSubscribers_(_self, _cmd, pm):
+            s.pump(s._notify)
+
+        def peripheralManager_didReceiveWriteRequests_(_self, _cmd, pm, reqs):
+            s._writes(ObjCInstance(reqs))
+
+        peripheralManagerDidUpdateState_.encoding = b"v@:@"
+        peripheralManager_didAddService_error_.encoding = b"v@:@@@"
+        peripheralManagerDidStartAdvertising_error_.encoding = b"v@:@@"
+        peripheralManager_central_didSubscribeToCharacteristic_.encoding = b"v@:@@@"
+        peripheralManager_central_didUnsubscribeFromCharacteristic_.encoding = b"v@:@@@"
+        peripheralManagerIsReadyToUpdateSubscribers_.encoding = b"v@:@"
+        peripheralManager_didReceiveWriteRequests_.encoding = b"v@:@@"
+        self.delegate = _delegate("ECGBleSender", [
+            peripheralManagerDidUpdateState_, peripheralManager_didAddService_error_,
+            peripheralManagerDidStartAdvertising_error_,
+            peripheralManager_central_didSubscribeToCharacteristic_,
+            peripheralManager_central_didUnsubscribeFromCharacteristic_,
+            peripheralManagerIsReadyToUpdateSubscribers_, peripheralManager_didReceiveWriteRequests_,
+        ], ["CBPeripheralManagerDelegate"])
+        self.pm = _cb("CBPeripheralManager").alloc().initWithDelegate_queue_(self.delegate, None)
+
+    def stop(self):
+        self.job = None
+        if self.pm is not None:
+            self.pm.stopAdvertising()
+            self.pm.removeAllServices()
+            self.pm.setDelegate_(None)
+            self.pm = None
+
+    def send(self, name, data, fmt="4", timeout=SEND_TIMEOUT):
+        if self.job:
+            raise RuntimeError("送信中です。終わるまでお待ちください")
+        if not 0 < len(data) <= MAX_SIZE:
+            raise ValueError("サイズが不正です（%d バイト）" % len(data))
+        job = self.job = {"name": name, "data": data, "fmt": fmt}
+        _main(self._go)
+        _later(timeout, lambda: self._timeout(job, timeout))
+
+    def _go(self):
+        if self.ready:
+            self._advertise()
+        else:
+            self.on_log("Bluetooth の準備を待っています…")
+
+    def _timeout(self, job, sec):
+        if self.job is job:
+            if "packets" in job:
+                self.finish(False, "iPhone から受信の確認が届きませんでした（%d 秒）" % sec)
+            else:
+                self.finish(False, "iPhone が見つかりませんでした（%d 秒）。iPhone で ecg_viewer_iphone.py が"
+                                   "起動しているか確認してください" % sec)
+
+    def _state(self, pm):
+        st = pm.state()
+        self.on_log("Bluetooth: %s" % _BT_STATE.get(st, st))
+        if st != 5:
+            self.ready = False
+            if _bt_hint(st):
+                self.on_log(_bt_hint(st))
+            return
+        self.data_char = _cb("CBMutableCharacteristic").alloc().initWithType_properties_value_permissions_(
+            _uuid(DATA_UUID), 0x10, None, 0x01)            # Notify / Readable
+        ack_char = _cb("CBMutableCharacteristic").alloc().initWithType_properties_value_permissions_(
+            _uuid(ACK_UUID), 0x08, None, 0x02)             # Write / Writeable
+        from objc_util import ns
+        svc = _cb("CBMutableService").alloc().initWithType_primary_(_uuid(SERVICE_UUID), True)
+        svc.setCharacteristics_(ns([self.data_char, ack_char]))
+        pm.removeAllServices()
+        pm.addService_(svc)
+
+    def _added(self, err):
+        if err:
+            self.on_log("BLE サービスの登録に失敗: %s" % err)
+            return
+        self.ready = True
+        self.on_log("BLE の準備ができました")
+        if self.job:
+            self._advertise()
+
+    def _advertise(self):
+        from objc_util import ns
+        self.pm.stopAdvertising()
+        self.pm.startAdvertising_(ns({"kCBAdvDataLocalName": BLE_NAME,
+                                      "kCBAdvDataServiceUUIDs": [_uuid(SERVICE_UUID)]}))
+
+    def _advertising(self, err):
+        if err:
+            if self.job:
+                self.finish(False, "アドバタイズを開始できません: %s" % err)
+            return
+        self.on_log("iPhone の接続を待っています…（BLE）")
+
+    def _subscribed(self, central, ch):
+        if _uuid_of(ch) != DATA_UUID or not self.job or "packets" in self.job:
+            return
+        try:
+            self.begin(int(central.maximumUpdateValueLength()))
+        except Exception as e:
+            self.finish(False, str(e))
+            return
+        self.pump(self._notify)
+
+    def _notify(self, pkt):
+        from objc_util import ns
+        return bool(self.pm.updateValue_forCharacteristic_onSubscribedCentrals_(ns(pkt), self.data_char, None))
+
+    def _unsubscribed(self):
+        if self.job and "packets" in self.job:
+            self.finish(False, "送信の途中で iPhone との接続が切れました")
+
+    def _writes(self, reqs):
+        texts = []
+        for i in range(reqs.count()):
+            r = reqs.objectAtIndex_(i)
+            if _uuid_of(r.characteristic()) == ACK_UUID and r.value():
+                texts.append(self._bytes(r.value()).decode("utf-8", "replace"))
+        if reqs.count():
+            self.pm.respondToRequest_withResult_(reqs.objectAtIndex_(0), 0)
+        for t in texts:
+            self.ack(t)
+
+
+class BleReceiver(object):
+    """受信側（iPhone）。iPad をサービス UUID で探して接続し、受け取った CSV を save_dir に保存して
+    on_file(path, fmt) を呼ぶ。受信が終わると切断して、次の送信を待つ。"""
+
+    def __init__(self, save_dir, on_file, on_log=None):
         self.save_dir = save_dir
         self.on_file = on_file
         self.on_log = on_log or (lambda m: None)
-        self.name = name
-        self.port = port
+        self.asm = Assembler()
+        self.cm = None
+        self.per = None
+        self.data_char = self.ack_char = None
         self.running = False
-        self._socks = []
+        self._done = None
+        self._pct = 0
 
-    def start(self):
-        import threading
-        if not os.path.isdir(self.save_dir):
-            os.makedirs(self.save_dir)
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("", self.port))
-        srv.listen(2)
-        srv.settimeout(0.5)
-        self._socks.append(srv)
-        self.running = True
-        threading.Thread(target=self._serve, args=(srv,), daemon=True).start()
+    # --- BLE に依存しない部分
+    def receive(self, pkt):
+        """1パケット処理する。iPad へ返す応答（bytes）を返す。受信途中なら None。"""
         try:
-            u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            u.bind(("", DISC_PORT))
-            u.settimeout(0.5)
-            self._socks.append(u)
-            threading.Thread(target=self._answer, args=(u,), daemon=True).start()
-        except OSError as e:
-            self.on_log("自動検出は使えません（%s）。送信側でIPを入力してください" % e)
+            got = self.asm.feed(pkt)
+        except Exception as e:
+            self.asm.reset()
+            self.on_log("受信エラー: %s" % e)
+            return ("NG %s" % e).encode("utf-8")[:ACK_MAX]
+        if pkt[:1] == b"H":
+            self._pct = 0
+            self.on_log("受信開始: %s（%d バイト）" % (self.asm.meta.get("name"), int(self.asm.meta["size"])))
+        elif got is None and self.asm.active:
+            pct = len(self.asm.buf) * 100 // int(self.asm.meta["size"])
+            if pct >= self._pct + 20:
+                self._pct = pct - pct % 20
+                self.on_log("  受信中… %d%%" % pct)
+        if got is None:
+            return None
+        name, data, fmt = got
+        try:
+            if not os.path.isdir(self.save_dir):
+                os.makedirs(self.save_dir)
+            path = os.path.join(self.save_dir, safe_name(name))
+            with open(path, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            self.on_log("保存に失敗: %s" % e)
+            return ("NG 保存に失敗 %s" % e).encode("utf-8")[:ACK_MAX]
+        self.on_log("受信 %s（%d バイト、BLE）" % (os.path.basename(path), len(data)))
+        self._done = (path, fmt)
+        return ("OK %s" % os.path.basename(path)).encode("utf-8")[:ACK_MAX]
+
+    def take_file(self):
+        d, self._done = self._done, None
+        return d
+
+    # --- BLE
+    def start(self):
+        from objc_util import ObjCInstance, nsdata_to_bytes
+        s = self
+        self._bytes = nsdata_to_bytes
+
+        def centralManagerDidUpdateState_(_self, _cmd, cm):
+            s._state(ObjCInstance(cm))
+
+        def centralManager_didDiscoverPeripheral_advertisementData_RSSI_(_self, _cmd, cm, p, adv, rssi):
+            s._found(ObjCInstance(p))
+
+        def centralManager_didConnectPeripheral_(_self, _cmd, cm, p):
+            s._connected(ObjCInstance(p))
+
+        def centralManager_didFailToConnectPeripheral_error_(_self, _cmd, cm, p, err):
+            s._lost("接続できませんでした")
+
+        def centralManager_didDisconnectPeripheral_error_(_self, _cmd, cm, p, err):
+            s._lost(None)
+
+        def peripheral_didDiscoverServices_(_self, _cmd, p, err):
+            s._services(ObjCInstance(p))
+
+        def peripheral_didDiscoverCharacteristicsForService_error_(_self, _cmd, p, svc, err):
+            s._chars(ObjCInstance(p), ObjCInstance(svc))
+
+        def peripheral_didUpdateValueForCharacteristic_error_(_self, _cmd, p, ch, err):
+            s._value(ObjCInstance(ch))
+
+        def peripheral_didWriteValueForCharacteristic_error_(_self, _cmd, p, ch, err):
+            s._written()
+
+        centralManagerDidUpdateState_.encoding = b"v@:@"
+        centralManager_didDiscoverPeripheral_advertisementData_RSSI_.encoding = b"v@:@@@@"
+        centralManager_didConnectPeripheral_.encoding = b"v@:@@"
+        centralManager_didFailToConnectPeripheral_error_.encoding = b"v@:@@@"
+        centralManager_didDisconnectPeripheral_error_.encoding = b"v@:@@@"
+        peripheral_didDiscoverServices_.encoding = b"v@:@@"
+        peripheral_didDiscoverCharacteristicsForService_error_.encoding = b"v@:@@@"
+        peripheral_didUpdateValueForCharacteristic_error_.encoding = b"v@:@@@"
+        peripheral_didWriteValueForCharacteristic_error_.encoding = b"v@:@@@"
+        self.delegate = _delegate("ECGBleReceiver", [
+            centralManagerDidUpdateState_, centralManager_didDiscoverPeripheral_advertisementData_RSSI_,
+            centralManager_didConnectPeripheral_, centralManager_didFailToConnectPeripheral_error_,
+            centralManager_didDisconnectPeripheral_error_, peripheral_didDiscoverServices_,
+            peripheral_didDiscoverCharacteristicsForService_error_,
+            peripheral_didUpdateValueForCharacteristic_error_, peripheral_didWriteValueForCharacteristic_error_,
+        ], ["CBCentralManagerDelegate", "CBPeripheralDelegate"])
+        self.running = True
+        self.cm = _cb("CBCentralManager").alloc().initWithDelegate_queue_(self.delegate, None)
 
     def stop(self):
         self.running = False
-        for s in self._socks:
-            try:
-                s.close()
-            except OSError:
-                pass
-        self._socks = []
+        if self.cm is not None:
+            self.cm.stopScan()
+            if self.per is not None:
+                self.cm.cancelPeripheralConnection_(self.per)
+            self.cm.setDelegate_(None)
+            self.cm = None
+        self.per = None
 
-    def _answer(self, u):
-        while self.running:
-            try:
-                data, addr = u.recvfrom(512)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if data.startswith(DISC_Q):
-                try:
-                    u.sendto(DISC_A + b" " + self.name.encode("utf-8"), addr)
-                except OSError:
-                    pass
+    def _scan(self):
+        from objc_util import ns
+        if self.running and self.cm is not None and self.per is None:
+            self.cm.scanForPeripheralsWithServices_options_(ns([_uuid(SERVICE_UUID)]), None)
 
-    def _serve(self, srv):
-        while self.running:
-            try:
-                conn, addr = srv.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            try:
-                conn.settimeout(15)
-                path, fmt = self._handle(conn, addr)
-                conn.sendall(("OK %s\n" % os.path.basename(path)).encode("utf-8"))
-            except Exception as e:  # 受信エラーは送信側へ返し、画面にも出す
-                self.on_log("受信エラー（%s）: %s" % (addr[0], e))
-                try:
-                    conn.sendall(("NG %s\n" % e).encode("utf-8"))
-                except OSError:
-                    pass
-                continue
-            finally:
-                conn.close()
-            self.on_file(path, fmt)
+    def _state(self, cm):
+        st = cm.state()
+        if st == 5:
+            self.on_log("BLE 受信待機中（iPad の「送信」を待っています）")
+            self._scan()
+        else:
+            self.on_log("Bluetooth: %s　%s" % (_BT_STATE.get(st, st), _bt_hint(st)))
 
-    def _handle(self, conn, addr):
-        if _recv_line(conn, 16) != MAGIC:
-            raise ValueError("送信プログラムからの接続ではありません")
-        meta = json.loads(_recv_line(conn).decode("utf-8"))
-        size = int(meta.get("size", -1))
-        if not 0 < size <= MAX_SIZE:
-            raise ValueError("サイズが不正です（%s）" % size)
-        data = _recv_exact(conn, size)
-        path = os.path.join(self.save_dir, safe_name(meta.get("name")))
-        with open(path, "wb") as f:
-            f.write(data)
-        self.on_log("受信 %s（%d バイト、%s）" % (os.path.basename(path), size, addr[0]))
-        return path, str(meta.get("fmt", "auto"))
+    def _found(self, p):
+        if self.per is not None:
+            return
+        self.cm.stopScan()
+        self.per = p
+        p.setDelegate_(self.delegate)
+        self.on_log("iPad を見つけました（%s）。接続しています…" % (p.name() or BLE_NAME))
+        self.cm.connectPeripheral_options_(p, None)
+        _later(CONNECT_TIMEOUT, lambda: self._watchdog(p))
+
+    def _watchdog(self, p):
+        if self.per is p and self.data_char is None and not self.asm.active and self.cm is not None:
+            self.on_log("iPad から応答がないため、探し直します")
+            self.cm.cancelPeripheralConnection_(p)
+
+    def _connected(self, p):
+        from objc_util import ns
+        p.discoverServices_(ns([_uuid(SERVICE_UUID)]))
+
+    def _services(self, p):
+        for svc in (p.services() or []):
+            if _uuid_of(svc) == SERVICE_UUID:
+                p.discoverCharacteristics_forService_(None, svc)
+
+    def _chars(self, p, svc):
+        for ch in (svc.characteristics() or []):
+            u = _uuid_of(ch)
+            if u == DATA_UUID:
+                self.data_char = ch
+            elif u == ACK_UUID:
+                self.ack_char = ch
+        if self.data_char is not None and self.ack_char is not None:
+            p.setNotifyValue_forCharacteristic_(True, self.data_char)
+        else:
+            self.on_log("iPad の BLE サービスが不完全です")
+            self.cm.cancelPeripheralConnection_(p)
+
+    def _value(self, ch):
+        if _uuid_of(ch) != DATA_UUID or ch.value() is None:
+            return
+        reply = self.receive(self._bytes(ch.value()))
+        if reply is not None and self.per is not None and self.ack_char is not None:
+            from objc_util import ns
+            self.per.writeValue_forCharacteristic_type_(ns(reply), self.ack_char, 0)  # 0＝応答あり
+        got = self.take_file()
+        if got:
+            self.on_file(*got)
+
+    def _written(self):
+        if self.per is not None and not self.asm.active:
+            self.cm.cancelPeripheralConnection_(self.per)  # 1ファイル受け取ったら切断して次を待つ
+
+    def _lost(self, why):
+        if self.asm.active:
+            self.on_log("受信の途中で iPad との接続が切れました")
+        elif why:
+            self.on_log(why)
+        self.asm.reset()
+        self.per = None
+        self.data_char = self.ack_char = None
+        self._scan()
 
 import types as _types
 core = _types.SimpleNamespace(**{k: v for k, v in dict(globals()).items() if not k.startswith("__")})
@@ -882,7 +1228,6 @@ class ECGViewer(ui.View):
         self.log = "起動しました"
         self.landscape = None
         self.receiver = None
-        self.ip = core.local_ip()
 
         # 縦向き
         self.p = ui.View(background_color=C["bg"])
@@ -922,11 +1267,10 @@ class ECGViewer(ui.View):
     # ---------- 受信
     def start_receiver(self):
         try:
-            self.receiver = core.Receiver(SAVE_DIR, self.on_received, self.on_log,
-                                          name="iPhone ECGビューア")
+            self.receiver = core.BleReceiver(SAVE_DIR, self.on_received, self.on_log)
             self.receiver.start()
-            self.on_log("受信待機中  %s : %d" % (self.ip, core.TCP_PORT))
-        except OSError as e:
+            self.on_log("BLE を準備しています…")
+        except Exception as e:
             self.on_log("受信を開始できません: %s" % e)
 
     def on_log(self, m):
@@ -1042,7 +1386,7 @@ class ECGViewer(ui.View):
 
     def info_lines(self):
         if self.cur is None:
-            return ["受信を待っています（%s : %d）" % (self.ip, core.TCP_PORT),
+            return ["iPad からの受信を待っています（BLE）",
                     "または「ファイル」から受信したCSVを選んでください"]
         m, c = self.meta, self.cur
         out = [m["name"], "%.1f 秒 / %d 点　（%s）" % (c["sec"], len(c["samples"]), m["hdr"])]
