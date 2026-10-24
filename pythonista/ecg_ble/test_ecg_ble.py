@@ -384,9 +384,10 @@ class FCM(object):
         return 5
 
     def scanForPeripheralsWithServices_options_(self, uuids, opt):
-        self.filtered = uuids is not None
-        if self.filtered:
-            assert uuids[0].UUIDString() == tx.core.SERVICE_UUID
+        # 実機では (None, None) の全機器スキャンが ArgumentError になった。必ずサービス UUID で探す
+        assert uuids is not None, "サービス UUID なしでスキャンしています"
+        self.filtered = True
+        assert uuids[0].UUIDString() == tx.core.SERVICE_UUID
         self.scanning = True
         if W[0].advertising or (not self.filtered and W[0].device_visible):
             self.discover()
@@ -510,9 +511,6 @@ class CoreBluetoothFlowTest(unittest.TestCase):
         W[0].run()
         snd.send(name, raw, "4")
         W[0].run()
-        if hide_service:
-            self.assertEqual(done, [])               # サービス UUID では見つからない
-            self.assertEqual(W[0].fire("_check_wide"), 1)   # WIDE_SCAN_AFTER 秒後に名前でも探す
         self.assertTrue(any(tx.core.BLE_VERSION in m for m in logs), "\n".join(logs))   # 版が表示される
         errors = [m for m in logs if "エラー" in m]
         self.assertEqual(errors, [], "\n".join(logs))
@@ -531,21 +529,13 @@ class CoreBluetoothFlowTest(unittest.TestCase):
     def test_flow_ipad_started_first_with_full_queue(self):
         self.flow(False, full_every=5)
 
-    def test_flow_found_by_name_when_service_not_advertised(self):
-        logs = self.flow(True, hide_service=True)
-        self.assertTrue(any("TB016" in m for m in logs), "\n".join(logs))
-
     def test_end_sequence(self):
         logs = self.flow(True)
         w = W[0]
         self.assertTrue(any("iPhone: 受信完了（1 件目）" in m for m in logs), "\n".join(logs))
         self.assertTrue(any("iPad: 送信を終了しました（成功）" in m for m in logs), "\n".join(logs))
-        # 受信後の iPhone：サービス UUID だけで待つ（受信前に予約した「名前で探す」が来ても探さない）
-        self.assertTrue(w.cm.filtered)
-        n = len(logs)
-        w.fire("_check_wide")
-        self.assertTrue(w.cm.filtered)
-        self.assertEqual([m for m in logs[n:] if "名前" in m], [], "\n".join(logs))
+        # 受信後の iPhone：接続を切り、サービス UUID で次の送信を待つ
+        self.assertTrue(w.cm.scanning)
         self.assertIsNone(self.rcv.per)
         # 時間がたっても（タイムアウト・接続確認）何も起きない
         n = len(logs)
@@ -554,36 +544,6 @@ class CoreBluetoothFlowTest(unittest.TestCase):
         self.assertEqual(self.done, [(True, sample_csv()[0])])
         self.assertEqual([m for m in logs[n:] if "エラー" in m or "失敗" in m], [], "\n".join(logs))
         self.assertFalse(w.advertising)
-
-    def test_iphone_connected_before_send(self):
-        """iPhone が名前で先に接続して待っていても、「送信」で送れる。"""
-        W[0] = World(device_visible=True)
-        logs, done, files = [], [], []
-        snd = tx.core.BleSender(lambda m: logs.append("iPad: " + m), lambda ok, msg: done.append((ok, msg)))
-        rcv = rx.core.BleReceiver(self.tmp, lambda p, f: files.append(p), lambda m: logs.append("iPhone: " + m))
-        snd.start()
-        rcv.start()
-        W[0].run()
-        self.assertEqual(W[0].fire("_check_wide"), 1)
-        self.assertTrue(any("「送信」を押すと送ります" in m for m in logs), "\n".join(logs))
-        name, raw = sample_csv()
-        snd.send(name, raw, "4")
-        W[0].run()
-        self.assertEqual(done, [(True, name)], "\n".join(logs))
-        self.assertEqual(len(files), 1)
-
-    def test_ipad_app_not_running(self):
-        """iPad 本体は名前で見えるがアプリが動いていない：つないでは切る、を繰り返さない。"""
-        W[0] = World(device_visible=True)
-        logs = []
-        rcv = rx.core.BleReceiver(self.tmp, lambda p, f: None, lambda m: logs.append(m))
-        rcv.start()
-        W[0].run()
-        self.assertEqual(W[0].fire("_check_wide"), 1)
-        self.assertTrue(any("送信の準備ができていません" in m for m in logs), "\n".join(logs))
-        self.assertIsNone(rcv.per)
-        self.assertTrue(W[0].cm.filtered)                  # サービス UUID だけで待つ
-        self.assertEqual(W[0].fire("_check_wide"), 0)      # しばらく名前では探さない
 
     def test_send_twice(self):
         logs = self.flow(True)

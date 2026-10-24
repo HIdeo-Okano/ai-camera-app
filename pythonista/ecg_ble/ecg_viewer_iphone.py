@@ -329,7 +329,7 @@ def analyze(d):
 #     b"H" + JSON（name, size, crc, fmt）／ b"D" + 連番4バイト + データ ／ b"E"（終了）
 #   応答：iPhone が ACK キャラクタリスティックへ "OK <保存したファイル名>" または "NG <理由>" を書き込む
 #   終わり方：
-#     iPhone … 応答を書き込んだら切断し、サービス UUID だけで次の送信を待つ（名前では探さない）
+#     iPhone … 応答を書き込んだら切断し、サービス UUID で次の送信を待つ
 #     iPad   … 応答を受け取ったらアドバタイズを止め、BLE の準備は残したまま次の「送信」を待つ
 #   ※ Pythonista の cb モジュールは使わない（Pythonista 3.4 では書き込みが PY_SSIZE_T_CLEAN エラーになる）。
 #     両側とも objc_util で CoreBluetooth を直接使う。
@@ -339,11 +339,10 @@ SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
 BLE_NAME = "ECG-TX"
-BLE_VERSION = "2026-10-25 r8"     # 起動時に表示（どのファイルが動いているか確かめるため）
-# 受信側（iPhone）は、まずサービス UUID で iPad を探す。WIDE_SCAN_AFTER 秒見つからなければ、
-# 下の名前の機器も探す（接続後にサービスを確かめるので、別の機器につながることはない）。
-IPAD_NAMES = ("TB016", BLE_NAME)
-WIDE_SCAN_AFTER = 8
+BLE_VERSION = "2026-10-25 r9"     # 起動時に表示（どのファイルが動いているか確かめるため）
+# 受信側（iPhone）はサービス UUID だけで iPad を探す（iPad の端末名は使わない）。
+# 名前で全機器を探す処理（サービスを指定しないスキャン）は、Pythonista で
+# ArgumentError になり、iPad 本体に何度もつなぎ直す原因にもなったため使わない。
 MAX_SIZE = 20 * 1024 * 1024
 SEND_TIMEOUT = 120       # 送信側：iPhone が接続してくるまで・確認が届くまでの待ち時間（秒）
 CONNECT_TIMEOUT = 15     # 受信側：接続してから受信が始まるまでの待ち時間（秒）
@@ -810,10 +809,6 @@ class BleReceiver(_BleBase):
         self.running = False
         self._done = None
         self._pct = 0
-        self._wide = False
-        self._scan_no = 0
-        self._wide_no = 0
-        self._wide_block = 0.0   # この時刻までは名前で探さない
         self._watch = None
         self.received = 0        # 受信できたファイルの数
         self._just_done = False  # 受信を終えて切断するところ
@@ -883,27 +878,7 @@ class BleReceiver(_BleBase):
     def _scan(self):
         from objc_util import ns
         if self.running and self.cm is not None and self.per is None:
-            self._wide = False
-            self._scan_no += 1
-            no = self._scan_no
             self.cm.scanForPeripheralsWithServices_options_(ns([_uuid(SERVICE_UUID)]), None)
-            # 名前で探すのは、まだ一度も受信していないときだけ（受信後は iPad 本体が名前で見え続けるため）
-            if self.received == 0 and time.time() >= self._wide_block:
-                self._wide_no = no
-                _later(WIDE_SCAN_AFTER, self._check_wide)
-
-    def _check_wide(self):
-        self._wide_scan(self._wide_no)
-
-    def _wide_scan(self, no):
-        """サービス UUID で見つからないとき、名前（IPAD_NAMES）でも探す。"""
-        if (no != self._scan_no or not self.running or self.cm is None or self.per is not None
-                or self.received):
-            return
-        self._wide = True
-        self.cm.stopScan()
-        self.cm.scanForPeripheralsWithServices_options_(None, None)
-        self.on_log("名前（%s）でも iPad を探しています…" % " / ".join(IPAD_NAMES))
 
     def _state(self, cm):
         st = cm.state()
@@ -916,9 +891,6 @@ class BleReceiver(_BleBase):
     def _found(self, p, adv=None):
         if self.per is not None:
             return
-        if self._wide:  # 名前で探しているときは、名前が一致する機器だけ
-            if not self._name_matches(p):
-                return
         self.cm.stopScan()
         self.per = p
         p.setDelegate_(self.delegate)
@@ -926,15 +898,6 @@ class BleReceiver(_BleBase):
         self.cm.connectPeripheral_options_(p, None)
         self._watch = p
         _later(CONNECT_TIMEOUT, self._check_watchdog)
-
-    @staticmethod
-    def _name_matches(p):
-        try:
-            name = p.name()
-            name = str(name) if name is not None else ""
-        except Exception:   # 名前を読めない機器は対象外
-            return False
-        return name.lower() in [x.lower() for x in IPAD_NAMES]
 
     def _check_watchdog(self):
         p, self._watch = self._watch, None
@@ -953,7 +916,6 @@ class BleReceiver(_BleBase):
                 return
         self.on_log("%s は送信の準備ができていません（iPad で ecg_sender_ipad.py を起動してください）"
                     % (p.name() or "機器"))
-        self._wide_block = time.time() + 60   # しばらく名前では探さない（つないでは切る、を繰り返さないため）
         self.cm.cancelPeripheralConnection_(p)
 
     def _chars(self, p, svc):
