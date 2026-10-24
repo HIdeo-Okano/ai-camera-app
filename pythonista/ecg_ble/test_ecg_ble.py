@@ -432,6 +432,8 @@ def _install_fake_objc():
             assert isinstance(getattr(f, "encoding", ""), str), f.__name__
             # 引数の数がエンコーディング（戻り値・self・_cmd を除く @ の数）と合っているか
             assert f.__code__.co_argcount == len(f.encoding) - 1, f.__name__
+            # iPad の Pythonista ではクロージャの変数が空になり NameError になった（実機で発生）
+            assert f.__closure__ is None, "%s はクロージャを使っています" % f.__name__
 
         class D(object):
             pass
@@ -441,7 +443,7 @@ def _install_fake_objc():
     sys.modules["objc_util"] = m
     for mod in (tx, rx):
         mod._CB.clear()
-        mod._later = lambda sec, fn: None   # タイムアウト用タイマーは使わない
+        mod._later = lambda sec, fn, *args: None   # タイムアウト用タイマーは使わない
 
 
 class CoreBluetoothFlowTest(unittest.TestCase):
@@ -476,6 +478,7 @@ class CoreBluetoothFlowTest(unittest.TestCase):
             self.assertEqual(done, [])               # サービス UUID では見つからない
             rcv._wide_scan(rcv._scan_no)            # WIDE_SCAN_AFTER 秒後に名前でも探す
             W[0].run()
+        self.assertTrue(any(tx.core.BLE_VERSION in m for m in logs), "\n".join(logs))   # 版が表示される
         errors = [m for m in logs if "エラー" in m]
         self.assertEqual(errors, [], "\n".join(logs))
         self.assertEqual(done, [(True, name)], "\n".join(logs))

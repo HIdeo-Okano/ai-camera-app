@@ -337,6 +337,7 @@ SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
 BLE_NAME = "ECG-TX"
+BLE_VERSION = "2026-10-25 r6"     # 起動時に表示（どのファイルが動いているか確かめるため）
 # 受信側（iPhone）は、まずサービス UUID で iPad を探す。WIDE_SCAN_AFTER 秒見つからなければ、
 # 下の名前の機器も探す（接続後にサービスを確かめるので、別の機器につながることはない）。
 IPAD_NAMES = ("TB016", BLE_NAME)
@@ -453,14 +454,14 @@ def _delegate(base, methods, protocols):
     return create_objc_class(name, methods=methods, protocols=protocols).new()
 
 
-def _main(fn):
+def _main(fn, *args):
     """CoreBluetooth の操作はメインスレッドで行う。"""
     from objc_util import on_main_thread
-    on_main_thread(fn)()
+    on_main_thread(fn)(*args)
 
 
-def _later(sec, fn):
-    t = threading.Timer(sec, lambda: _main(fn))
+def _later(sec, fn, *args):
+    t = threading.Timer(sec, _main, args=(fn,) + args)
     t.daemon = True
     t.start()
 
@@ -476,18 +477,126 @@ def _bt_hint(st):
     return ""
 
 
+# ----- CoreBluetooth から呼ばれる関数（デリゲート）
+#   入れ子の関数（クロージャ）にすると、iPad の Pythonista で呼ばれた時に変数が空になり
+#   NameError（free variable ... referenced before assignment）になったため、
+#   モジュール直下の関数にして、動作中の送信側／受信側を _ACTIVE から探して呼ぶ。
+_ACTIVE = {}
+
+
+def _O(p):
+    from objc_util import ObjCInstance
+    return ObjCInstance(p) if p else None
+
+
+def _call(h, name, ptrs):
+    getattr(h, name)(*[_O(p) for p in ptrs])
+
+
+def _dispatch(role, name, *ptrs):
+    h = _ACTIVE.get(role)
+    if h is not None:
+        h._try(_call, h, name, ptrs)
+
+
+# 送信側（iPad：ペリフェラル）
+def peripheralManagerDidUpdateState_(_self, _cmd, pm):
+    _dispatch("sender", "_state", pm)
+
+
+def peripheralManager_didAddService_error_(_self, _cmd, pm, svc, err):
+    _dispatch("sender", "_added", err)
+
+
+def peripheralManagerDidStartAdvertising_error_(_self, _cmd, pm, err):
+    _dispatch("sender", "_advertising", err)
+
+
+def peripheralManager_central_didSubscribeToCharacteristic_(_self, _cmd, pm, central, ch):
+    _dispatch("sender", "_subscribed", central, ch)
+
+
+def peripheralManager_central_didUnsubscribeFromCharacteristic_(_self, _cmd, pm, central, ch):
+    _dispatch("sender", "_unsubscribed")
+
+
+def peripheralManagerIsReadyToUpdateSubscribers_(_self, _cmd, pm):
+    _dispatch("sender", "_ready")
+
+
+def peripheralManager_didReceiveWriteRequests_(_self, _cmd, pm, reqs):
+    _dispatch("sender", "_writes", reqs)
+
+
+# 受信側（iPhone：セントラル）
+def centralManagerDidUpdateState_(_self, _cmd, cm):
+    _dispatch("receiver", "_state", cm)
+
+
+def centralManager_didDiscoverPeripheral_advertisementData_RSSI_(_self, _cmd, cm, p, adv, rssi):
+    _dispatch("receiver", "_found", p, adv)
+
+
+def centralManager_didConnectPeripheral_(_self, _cmd, cm, p):
+    _dispatch("receiver", "_connected", p)
+
+
+def centralManager_didFailToConnectPeripheral_error_(_self, _cmd, cm, p, err):
+    _dispatch("receiver", "_failed")
+
+
+def centralManager_didDisconnectPeripheral_error_(_self, _cmd, cm, p, err):
+    _dispatch("receiver", "_disconnected")
+
+
+def peripheral_didDiscoverServices_(_self, _cmd, p, err):
+    _dispatch("receiver", "_services", p)
+
+
+def peripheral_didDiscoverCharacteristicsForService_error_(_self, _cmd, p, svc, err):
+    _dispatch("receiver", "_chars", p, svc)
+
+
+def peripheral_didUpdateValueForCharacteristic_error_(_self, _cmd, p, ch, err):
+    _dispatch("receiver", "_value", ch)
+
+
+def peripheral_didWriteValueForCharacteristic_error_(_self, _cmd, p, ch, err):
+    _dispatch("receiver", "_written")
+
+
+def peripheral_didUpdateNotificationStateForCharacteristic_error_(_self, _cmd, p, ch, err):
+    _dispatch("receiver", "_subscribed", err)
+
+
+_SENDER_METHODS = [
+    peripheralManagerDidUpdateState_, peripheralManager_didAddService_error_,
+    peripheralManagerDidStartAdvertising_error_, peripheralManager_central_didSubscribeToCharacteristic_,
+    peripheralManager_central_didUnsubscribeFromCharacteristic_, peripheralManagerIsReadyToUpdateSubscribers_,
+    peripheralManager_didReceiveWriteRequests_]
+_RECEIVER_METHODS = [
+    centralManagerDidUpdateState_, centralManager_didDiscoverPeripheral_advertisementData_RSSI_,
+    centralManager_didConnectPeripheral_, centralManager_didFailToConnectPeripheral_error_,
+    centralManager_didDisconnectPeripheral_error_, peripheral_didDiscoverServices_,
+    peripheral_didDiscoverCharacteristicsForService_error_, peripheral_didUpdateValueForCharacteristic_error_,
+    peripheral_didWriteValueForCharacteristic_error_, peripheral_didUpdateNotificationStateForCharacteristic_error_]
+for _f in _SENDER_METHODS + _RECEIVER_METHODS:
+    _f.encoding = "v@:" + "@" * (_f.__code__.co_argcount - 2)   # 戻り値なし・self・_cmd・引数（すべてオブジェクト）
+
+
 class _BleBase(object):
     def _set_log(self, on_log):
-        def log(m):
-            print("[BLE %s] %s" % (time.strftime("%H:%M:%S"), m))  # 画面を閉じた後もコンソールで確認できる
-            if on_log:
-                on_log(m)
-        self.on_log = log
+        self._ui_log = on_log
 
-    def _try(self, fn):
+    def on_log(self, m):
+        print("[BLE %s] %s" % (time.strftime("%H:%M:%S"), m))  # 画面を閉じた後もコンソールで確認できる
+        if self._ui_log:
+            self._ui_log(m)
+
+    def _try(self, fn, *args):
         """デリゲート内のエラーを画面とコンソールに出す（そのままだと見えずに止まるため）。"""
         try:
-            fn()
+            fn(*args)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -547,45 +656,11 @@ class BleSender(_BleBase):
 
     # --- BLE
     def start(self):
-        from objc_util import ObjCInstance, nsdata_to_bytes
-        s = self
+        from objc_util import nsdata_to_bytes
         self._bytes = nsdata_to_bytes
-
-        def peripheralManagerDidUpdateState_(_self, _cmd, pm):
-            s._try(lambda: s._state(ObjCInstance(pm)))
-
-        def peripheralManager_didAddService_error_(_self, _cmd, pm, svc, err):
-            s._try(lambda: s._added(err and ObjCInstance(err)))
-
-        def peripheralManagerDidStartAdvertising_error_(_self, _cmd, pm, err):
-            s._try(lambda: s._advertising(err and ObjCInstance(err)))
-
-        def peripheralManager_central_didSubscribeToCharacteristic_(_self, _cmd, pm, central, ch):
-            s._try(lambda: s._subscribed(ObjCInstance(central), ObjCInstance(ch)))
-
-        def peripheralManager_central_didUnsubscribeFromCharacteristic_(_self, _cmd, pm, central, ch):
-            s._try(lambda: s._unsubscribed())
-
-        def peripheralManagerIsReadyToUpdateSubscribers_(_self, _cmd, pm):
-            s._try(lambda: s.pump(s._notify))
-
-        def peripheralManager_didReceiveWriteRequests_(_self, _cmd, pm, reqs):
-            s._try(lambda: s._writes(ObjCInstance(reqs)))
-
-        peripheralManagerDidUpdateState_.encoding = "v@:@"
-        peripheralManager_didAddService_error_.encoding = "v@:@@@"
-        peripheralManagerDidStartAdvertising_error_.encoding = "v@:@@"
-        peripheralManager_central_didSubscribeToCharacteristic_.encoding = "v@:@@@"
-        peripheralManager_central_didUnsubscribeFromCharacteristic_.encoding = "v@:@@@"
-        peripheralManagerIsReadyToUpdateSubscribers_.encoding = "v@:@"
-        peripheralManager_didReceiveWriteRequests_.encoding = "v@:@@"
-        self.delegate = _delegate("ECGBleSender", [
-            peripheralManagerDidUpdateState_, peripheralManager_didAddService_error_,
-            peripheralManagerDidStartAdvertising_error_,
-            peripheralManager_central_didSubscribeToCharacteristic_,
-            peripheralManager_central_didUnsubscribeFromCharacteristic_,
-            peripheralManagerIsReadyToUpdateSubscribers_, peripheralManager_didReceiveWriteRequests_,
-        ], ["CBPeripheralManagerDelegate"])
+        self.on_log("BLE 送信を開始します（版 %s）" % BLE_VERSION)
+        _ACTIVE["sender"] = self
+        self.delegate = _delegate("ECGBleSender", _SENDER_METHODS, ["CBPeripheralManagerDelegate"])
         self.pm = _cb("CBPeripheralManager").alloc().initWithDelegate_queue_(self.delegate, None)
 
     def stop(self):
@@ -595,6 +670,8 @@ class BleSender(_BleBase):
             self.pm.removeAllServices()
             self.pm.setDelegate_(None)
             self.pm = None
+        if _ACTIVE.get("sender") is self:
+            del _ACTIVE["sender"]
 
     def send(self, name, data, fmt="4", timeout=SEND_TIMEOUT):
         if self.job:
@@ -603,7 +680,10 @@ class BleSender(_BleBase):
             raise ValueError("サイズが不正です（%d バイト）" % len(data))
         job = self.job = {"name": name, "data": data, "fmt": fmt}
         _main(self._go)
-        _later(timeout, lambda: self._timeout(job, timeout))
+        _later(timeout, self._timeout, job, timeout)
+
+    def _ready(self):
+        self.pump(self._notify)
 
     def _go(self):
         if self.ready:
@@ -746,58 +826,12 @@ class BleReceiver(_BleBase):
 
     # --- BLE
     def start(self):
-        from objc_util import ObjCInstance, nsdata_to_bytes
-        s = self
+        from objc_util import nsdata_to_bytes
         self._bytes = nsdata_to_bytes
-
-        def centralManagerDidUpdateState_(_self, _cmd, cm):
-            s._try(lambda: s._state(ObjCInstance(cm)))
-
-        def centralManager_didDiscoverPeripheral_advertisementData_RSSI_(_self, _cmd, cm, p, adv, rssi):
-            s._try(lambda: s._found(ObjCInstance(p), adv and ObjCInstance(adv)))
-
-        def centralManager_didConnectPeripheral_(_self, _cmd, cm, p):
-            s._try(lambda: s._connected(ObjCInstance(p)))
-
-        def centralManager_didFailToConnectPeripheral_error_(_self, _cmd, cm, p, err):
-            s._try(lambda: s._lost("接続できませんでした"))
-
-        def centralManager_didDisconnectPeripheral_error_(_self, _cmd, cm, p, err):
-            s._try(lambda: s._lost(None))
-
-        def peripheral_didDiscoverServices_(_self, _cmd, p, err):
-            s._try(lambda: s._services(ObjCInstance(p)))
-
-        def peripheral_didDiscoverCharacteristicsForService_error_(_self, _cmd, p, svc, err):
-            s._try(lambda: s._chars(ObjCInstance(p), ObjCInstance(svc)))
-
-        def peripheral_didUpdateValueForCharacteristic_error_(_self, _cmd, p, ch, err):
-            s._try(lambda: s._value(ObjCInstance(ch)))
-
-        def peripheral_didWriteValueForCharacteristic_error_(_self, _cmd, p, ch, err):
-            s._try(lambda: s._written())
-
-        def peripheral_didUpdateNotificationStateForCharacteristic_error_(_self, _cmd, p, ch, err):
-            s._try(lambda: s._subscribed(err and ObjCInstance(err)))
-
-        centralManagerDidUpdateState_.encoding = "v@:@"
-        centralManager_didDiscoverPeripheral_advertisementData_RSSI_.encoding = "v@:@@@@"
-        centralManager_didConnectPeripheral_.encoding = "v@:@@"
-        centralManager_didFailToConnectPeripheral_error_.encoding = "v@:@@@"
-        centralManager_didDisconnectPeripheral_error_.encoding = "v@:@@@"
-        peripheral_didDiscoverServices_.encoding = "v@:@@"
-        peripheral_didDiscoverCharacteristicsForService_error_.encoding = "v@:@@@"
-        peripheral_didUpdateValueForCharacteristic_error_.encoding = "v@:@@@"
-        peripheral_didWriteValueForCharacteristic_error_.encoding = "v@:@@@"
-        peripheral_didUpdateNotificationStateForCharacteristic_error_.encoding = "v@:@@@"
-        self.delegate = _delegate("ECGBleReceiver", [
-            centralManagerDidUpdateState_, centralManager_didDiscoverPeripheral_advertisementData_RSSI_,
-            centralManager_didConnectPeripheral_, centralManager_didFailToConnectPeripheral_error_,
-            centralManager_didDisconnectPeripheral_error_, peripheral_didDiscoverServices_,
-            peripheral_didDiscoverCharacteristicsForService_error_,
-            peripheral_didUpdateValueForCharacteristic_error_, peripheral_didWriteValueForCharacteristic_error_,
-            peripheral_didUpdateNotificationStateForCharacteristic_error_,
-        ], ["CBCentralManagerDelegate", "CBPeripheralDelegate"])
+        self.on_log("BLE 受信を開始します（版 %s）" % BLE_VERSION)
+        _ACTIVE["receiver"] = self
+        self.delegate = _delegate("ECGBleReceiver", _RECEIVER_METHODS,
+                                  ["CBCentralManagerDelegate", "CBPeripheralDelegate"])
         self.running = True
         self.cm = _cb("CBCentralManager").alloc().initWithDelegate_queue_(self.delegate, None)
 
@@ -810,6 +844,8 @@ class BleReceiver(_BleBase):
             self.cm.setDelegate_(None)
             self.cm = None
         self.per = None
+        if _ACTIVE.get("receiver") is self:
+            del _ACTIVE["receiver"]
 
     def _scan(self):
         from objc_util import ns
@@ -818,7 +854,7 @@ class BleReceiver(_BleBase):
             self._scan_no += 1
             no = self._scan_no
             self.cm.scanForPeripheralsWithServices_options_(ns([_uuid(SERVICE_UUID)]), None)
-            _later(WIDE_SCAN_AFTER, lambda: self._wide_scan(no))
+            _later(WIDE_SCAN_AFTER, self._wide_scan, no)
 
     def _wide_scan(self, no):
         """サービス UUID で見つからないとき、名前（IPAD_NAMES）でも探す。"""
@@ -851,7 +887,7 @@ class BleReceiver(_BleBase):
         p.setDelegate_(self.delegate)
         self.on_log("iPad を見つけました（%s）。接続しています…" % (p.name() or BLE_NAME))
         self.cm.connectPeripheral_options_(p, None)
-        _later(CONNECT_TIMEOUT, lambda: self._watchdog(p))
+        _later(CONNECT_TIMEOUT, self._watchdog, p)
 
     def _watchdog(self, p):
         if self.per is p and self.data_char is None and not self.asm.active and self.cm is not None:
@@ -905,6 +941,12 @@ class BleReceiver(_BleBase):
     def _written(self):
         if self.per is not None and not self.asm.active:
             self.cm.cancelPeripheralConnection_(self.per)  # 1ファイル受け取ったら切断して次を待つ
+
+    def _failed(self):
+        self._lost("接続できませんでした")
+
+    def _disconnected(self):
+        self._lost(None)
 
     def _lost(self, why):
         if self.asm.active:
