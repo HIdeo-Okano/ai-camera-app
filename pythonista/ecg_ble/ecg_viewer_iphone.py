@@ -332,10 +332,8 @@ def analyze(d):
 #     iPhone … 応答を書き込んだら切断し、サービス UUID で次の送信を待つ
 #     iPad   … 応答を受け取ったらアドバタイズを止め、BLE の準備は残したまま次の「送信」を待つ
 #   ※ Pythonista の cb モジュールは使わない（Pythonista 3.4 では書き込みが PY_SSIZE_T_CLEAN エラーになる）。
-#     両側とも objc_util で CoreBluetooth を直接使う。
-#   ※ objc_util はスレッドに安全ではない（呼び出しのたびに共有の objc_msgSend の型設定を書き換える）。
-#     2つのスレッドから同時に使うと 'tuple' object is not callable などの ArgumentError や
-#     アプリの強制終了になったため、CoreBluetooth の操作はすべてメインスレッドだけで行う。
+#     CoreBluetooth は下の _send() で直接呼ぶ（objc_util のメソッド呼び出しは使わない。理由は _send の上）。
+#   ※ CoreBluetooth の操作はすべてメインスレッドで行う
 #     （デリゲート・ui.delay の予約・ボタンの action はメインスレッドで動く）
 import zlib
 
@@ -343,7 +341,7 @@ SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
 BLE_NAME = "ECG-TX"
-BLE_VERSION = "2026-10-25 r11"     # 起動時に表示（どのファイルが動いているか確かめるため）
+BLE_VERSION = "2026-10-25 r12"     # 起動時に表示（どのファイルが動いているか確かめるため）
 # 受信側（iPhone）はサービス UUID だけで iPad を探す（iPad の端末名は使わない）。
 # 名前で全機器を探す処理（サービスを指定しないスキャン）は、Pythonista で
 # ArgumentError になり、iPad 本体に何度もつなぎ直す原因にもなったため使わない。
@@ -428,27 +426,128 @@ class Assembler(object):
         raise ValueError("不明なパケットです")
 
 
-# ----- CoreBluetooth（objc_util）
-_CB = {}
+# ----- Objective-C の呼び出し
+#   objc_util の ObjCInstance でメソッドを呼ぶと、内部で共有の objc_msgSend の型設定（argtypes・restype）を
+#   毎回書き換える。BLE のように iOS から次々と呼ばれる処理では、その途中で設定が壊れて
+#   'tuple' object is not callable などの ArgumentError や強制終了になった（iPhone・iPad の両方で発生）。
+#   そこで、呼び出しの型ごとに専用の objc_msgSend を作り（型は一度決めたら変えない）、それで直接呼ぶ。
+#   objc_util は、iOS から呼ばれる受け口（デリゲート）のクラスを作るときだけ使う。
+import ctypes
+
+_RT = {}
+_CTYPE = {"@": ctypes.c_void_p, "B": ctypes.c_bool, "q": ctypes.c_longlong, "Q": ctypes.c_ulonglong,
+          "*": ctypes.c_char_p, "v": None}
 _CLS_NO = [0]
 
 
-def _cb(name):
-    if not _CB:
-        from objc_util import ObjCClass, load_framework
+def _rt():
+    if not _RT:
+        from objc_util import load_framework
         load_framework("CoreBluetooth")
-        for n in ("CBUUID", "CBPeripheralManager", "CBCentralManager", "CBMutableService",
-                  "CBMutableCharacteristic"):
-            _CB[n] = ObjCClass(n)
-    return _CB[name]
+        lib = ctypes.CDLL(None)            # objc_util とは別の関数オブジェクトを使う
+        get_class = lib.objc_getClass
+        get_class.restype = ctypes.c_void_p
+        get_class.argtypes = [ctypes.c_char_p]
+        reg_sel = lib.sel_registerName
+        reg_sel.restype = ctypes.c_void_p
+        reg_sel.argtypes = [ctypes.c_char_p]
+        _RT.update(get_class=get_class, reg_sel=reg_sel, fns={}, sels={}, classes={},
+                   msg=ctypes.cast(lib.objc_msgSend, ctypes.c_void_p).value)
+    return _RT
+
+
+def _send(obj, sel, sig, *args):
+    """obj にメッセージ sel を送る。sig は「戻り値の型 + 引数の型」（@ ポインタ, B BOOL, q 整数, Q 符号なし整数,
+    * C 文字列, v なし）。例：updateValue:forCharacteristic:onSubscribedCentrals: → "B@@@" """
+    rt = _rt()
+    fn = rt["fns"].get(sig)
+    if fn is None:
+        proto = ctypes.CFUNCTYPE(_CTYPE[sig[0]], ctypes.c_void_p, ctypes.c_void_p, *[_CTYPE[c] for c in sig[1:]])
+        fn = rt["fns"][sig] = proto(rt["msg"])
+    s = rt["sels"].get(sel)
+    if s is None:
+        s = rt["sels"][sel] = rt["reg_sel"](sel.encode("ascii"))
+    return fn(obj, s, *args)
+
+
+def _cls(name):
+    rt = _rt()
+    c = rt["classes"].get(name)
+    if c is None:
+        c = rt["classes"][name] = rt["get_class"](name.encode("ascii"))
+    return c
+
+
+def _new(cls_name, init_sel, sig, *args):
+    return _send(_send(_cls(cls_name), "alloc", "@"), init_sel, sig, *args)
+
+
+def _retain(p):
+    return _send(p, "retain", "@") if p else None
+
+
+def _release(p):
+    if p:
+        _send(p, "release", "v")
+
+
+def _nsstr(s):
+    return _send(_cls("NSString"), "stringWithUTF8String:", "@*", s.encode("utf-8"))
+
+
+def _str(p):
+    if not p:
+        return None
+    b = _send(p, "UTF8String", "*")
+    return b.decode("utf-8", "replace") if b is not None else None
+
+
+def _nsdata(b):
+    b = bytes(b)
+    return _send(_cls("NSData"), "dataWithBytes:length:", "@*Q", b, len(b))
+
+
+def _bytes_of(p):
+    if not p:
+        return b""
+    n = _send(p, "length", "Q")
+    ptr = _send(p, "bytes", "@")
+    return ctypes.string_at(ptr, n) if n and ptr else b""
+
+
+def _nsarray(items):
+    arr = (ctypes.c_void_p * len(items))(*items)
+    return _send(_cls("NSArray"), "arrayWithObjects:count:", "@@Q", ctypes.cast(arr, ctypes.c_void_p), len(items))
+
+
+def _nsdict(pairs):
+    keys = (ctypes.c_void_p * len(pairs))(*[k for k, v in pairs])
+    vals = (ctypes.c_void_p * len(pairs))(*[v for k, v in pairs])
+    return _send(_cls("NSDictionary"), "dictionaryWithObjects:forKeys:count:", "@@@Q",
+                 ctypes.cast(vals, ctypes.c_void_p), ctypes.cast(keys, ctypes.c_void_p), len(pairs))
+
+
+def _items(arr):
+    if not arr:
+        return []
+    return [_send(arr, "objectAtIndex:", "@Q", i) for i in range(_send(arr, "count", "Q"))]
+
+
+def _err_text(err):
+    return _str(_send(err, "localizedDescription", "@")) if err else ""
+
+
+def _ptr_of(obj):
+    p = getattr(obj, "ptr", obj)
+    return p.value if isinstance(p, ctypes.c_void_p) else p
 
 
 def _uuid(s):
-    return _cb("CBUUID").UUIDWithString_(s)
+    return _send(_cls("CBUUID"), "UUIDWithString:", "@@", _nsstr(s))
 
 
-def _uuid_of(obj):
-    return str(obj.UUID().UUIDString()).upper()
+def _uuid_of(p):
+    return (_str(_send(_send(p, "UUID", "@"), "UUIDString", "@")) or "").upper()
 
 
 def _delegate(base, methods, protocols):
@@ -491,7 +590,6 @@ def _trace(msg):
 def _later(sec, fn):
     """sec 秒後にメインスレッドで fn() を呼ぶ。必ずメインスレッド（デリゲートやボタンの action）から呼ぶこと。
     ボタン用の別スレッドから予約すると、そのスレッドが終わった後に iPad の Pythonista が落ちた。
-    また引数を付けて on_main_thread に渡すと ArgumentError やクラッシュになったため、
     引数は渡さず、必要な値はオブジェクトに持たせておく。"""
     import ui
     _trace("later %s %ss" % (fn.__name__, sec))
@@ -513,16 +611,12 @@ def _bt_hint(st):
 #   入れ子の関数（クロージャ）にすると、iPad の Pythonista で呼ばれた時に変数が空になり
 #   NameError（free variable ... referenced before assignment）になったため、
 #   モジュール直下の関数にして、動作中の送信側／受信側を _ACTIVE から探して呼ぶ。
+#   引数は ObjC オブジェクトのポインタ（整数）のまま渡す。
 _ACTIVE = {}
 
 
-def _O(p):
-    from objc_util import ObjCInstance
-    return ObjCInstance(p) if p else None
-
-
 def _call(h, name, ptrs):
-    getattr(h, name)(*[_O(p) for p in ptrs])
+    getattr(h, name)(*ptrs)
 
 
 def _dispatch(role, name, *ptrs):
@@ -568,7 +662,7 @@ def centralManagerDidUpdateState_(_self, _cmd, cm):
 
 
 def centralManager_didDiscoverPeripheral_advertisementData_RSSI_(_self, _cmd, cm, p, adv, rssi):
-    _dispatch("receiver", "_found", p, adv)
+    _dispatch("receiver", "_found", p)
 
 
 def centralManager_didConnectPeripheral_(_self, _cmd, cm, p):
@@ -693,8 +787,8 @@ class BleSender(_BleBase):
         _trace("finish %s" % ok)
         self.job = None
         self._timeout_job = None
-        if self.pm is not None:
-            self.pm.stopAdvertising()
+        if self.pm:
+            _send(self.pm, "stopAdvertising", "v")
             _trace("finish: stopAdvertising done")
         self.on_log("送信を終了しました（%s）。次の「送信」を待っています" % ("成功" if ok else "失敗"))
         self.on_done(ok, msg)
@@ -702,21 +796,22 @@ class BleSender(_BleBase):
 
     # --- BLE
     def start(self):
-        from objc_util import nsdata_to_bytes
-        self._bytes = nsdata_to_bytes
         _trace_start("sender")
         self.on_log("BLE 送信を開始します（版 %s）" % BLE_VERSION)
         _ACTIVE["sender"] = self
         self.delegate = _delegate("ECGBleSender", _SENDER_METHODS, ["CBPeripheralManagerDelegate"])
-        self.pm = _cb("CBPeripheralManager").alloc().initWithDelegate_queue_(self.delegate, None)
+        self.pm = _new("CBPeripheralManager", "initWithDelegate:queue:", "@@@", _ptr_of(self.delegate), None)
 
     def stop(self):
         self.job = None
-        if self.pm is not None:
-            self.pm.stopAdvertising()
-            self.pm.removeAllServices()
-            self.pm.setDelegate_(None)
+        if self.pm:
+            _send(self.pm, "stopAdvertising", "v")
+            _send(self.pm, "removeAllServices", "v")
+            _send(self.pm, "setDelegate:", "v@", None)
+            _release(self.pm)
             self.pm = None
+        _release(self._central)
+        self._central = None
         if _ACTIVE.get("sender") is self:
             del _ACTIVE["sender"]
 
@@ -737,7 +832,7 @@ class BleSender(_BleBase):
         _later(self.job["timeout"], self._check_timeout)
         if not self.ready:
             self.on_log("Bluetooth の準備を待っています…")
-        elif self._central is not None:   # iPhone がもう接続して待っている
+        elif self._central:   # iPhone がもう接続して待っている
             self._start_job(self._central)
         else:
             self._advertise()
@@ -746,7 +841,7 @@ class BleSender(_BleBase):
         if not self.job or "packets" in self.job:
             return
         try:
-            self.begin(int(central.maximumUpdateValueLength()))
+            self.begin(int(_send(central, "maximumUpdateValueLength", "Q")))
         except Exception as e:
             self.finish(False, str(e))
             return
@@ -763,26 +858,28 @@ class BleSender(_BleBase):
                                    "起動しているか確認してください" % sec)
 
     def _state(self, pm):
-        st = pm.state()
+        st = _send(pm, "state", "q")
         self.on_log("Bluetooth: %s" % _BT_STATE.get(st, st))
         if st != 5:
             self.ready = False
             if _bt_hint(st):
                 self.on_log(_bt_hint(st))
             return
-        self.data_char = _cb("CBMutableCharacteristic").alloc().initWithType_properties_value_permissions_(
-            _uuid(DATA_UUID), 0x10, None, 0x01)            # Notify / Readable
-        ack_char = _cb("CBMutableCharacteristic").alloc().initWithType_properties_value_permissions_(
-            _uuid(ACK_UUID), 0x08, None, 0x02)             # Write / Writeable
-        from objc_util import ns
-        svc = _cb("CBMutableService").alloc().initWithType_primary_(_uuid(SERVICE_UUID), True)
-        svc.setCharacteristics_(ns([self.data_char, ack_char]))
-        pm.removeAllServices()
-        pm.addService_(svc)
+        _release(self.data_char)
+        self.data_char = _new("CBMutableCharacteristic", "initWithType:properties:value:permissions:", "@@Q@Q",
+                              _uuid(DATA_UUID), 0x10, None, 0x01)            # Notify / Readable
+        ack_char = _new("CBMutableCharacteristic", "initWithType:properties:value:permissions:", "@@Q@Q",
+                        _uuid(ACK_UUID), 0x08, None, 0x02)                   # Write / Writeable
+        svc = _new("CBMutableService", "initWithType:primary:", "@@B", _uuid(SERVICE_UUID), True)
+        _send(svc, "setCharacteristics:", "v@", _nsarray([self.data_char, ack_char]))
+        _send(pm, "removeAllServices", "v")
+        _send(pm, "addService:", "v@", svc)
+        _release(ack_char)   # サービスと PeripheralManager が持っている
+        _release(svc)
 
     def _added(self, err):
         if err:
-            self.on_log("BLE サービスの登録に失敗: %s" % err)
+            self.on_log("BLE サービスの登録に失敗: %s" % _err_text(err))
             return
         self.ready = True
         self.on_log("BLE の準備ができました")
@@ -790,47 +887,48 @@ class BleSender(_BleBase):
             self._advertise()
 
     def _advertise(self):
-        from objc_util import ns
-        self.pm.stopAdvertising()
-        self.pm.startAdvertising_(ns({"kCBAdvDataLocalName": BLE_NAME,
-                                      "kCBAdvDataServiceUUIDs": [_uuid(SERVICE_UUID)]}))
+        _send(self.pm, "stopAdvertising", "v")
+        adv = _nsdict([(_nsstr("kCBAdvDataLocalName"), _nsstr(BLE_NAME)),
+                       (_nsstr("kCBAdvDataServiceUUIDs"), _nsarray([_uuid(SERVICE_UUID)]))])
+        _send(self.pm, "startAdvertising:", "v@", adv)
 
     def _advertising(self, err):
         if err:
             if self.job:
-                self.finish(False, "アドバタイズを開始できません: %s" % err)
+                self.finish(False, "アドバタイズを開始できません: %s" % _err_text(err))
             return
         self.on_log("iPhone の接続を待っています…（BLE）")
 
     def _subscribed(self, central, ch):
         if _uuid_of(ch) != DATA_UUID:
             return
-        self._central = central
+        _release(self._central)
+        self._central = _retain(central)
         if self.job:
             self._start_job(central)
         else:
             self.on_log("iPhone が接続しました。「送信」を押すと送ります")
 
     def _notify(self, pkt):
-        from objc_util import ns
-        return bool(self.pm.updateValue_forCharacteristic_onSubscribedCentrals_(ns(pkt), self.data_char, None))
+        return bool(_send(self.pm, "updateValue:forCharacteristic:onSubscribedCentrals:", "B@@@",
+                          _nsdata(pkt), self.data_char, None))
 
     def _unsubscribed(self):
+        _release(self._central)
         self._central = None
         if self.job and "packets" in self.job:
             self.finish(False, "送信の途中で iPhone との接続が切れました")
 
     def _writes(self, reqs):
+        items = _items(reqs)
+        _trace("writes: %d" % len(items))
         texts = []
-        n = reqs.count()
-        _trace("writes: %d" % n)
-        for i in range(n):
-            r = reqs.objectAtIndex_(i)
-            if _uuid_of(r.characteristic()) == ACK_UUID and r.value():
-                texts.append(self._bytes(r.value()).decode("utf-8", "replace"))
+        for r in items:
+            if _uuid_of(_send(r, "characteristic", "@")) == ACK_UUID:
+                texts.append(_bytes_of(_send(r, "value", "@")).decode("utf-8", "replace"))
         _trace("writes: read %r" % texts)
-        if n:
-            self.pm.respondToRequest_withResult_(reqs.objectAtIndex_(0), 0)
+        if items:
+            _send(self.pm, "respondToRequest:withResult:", "v@q", items[0], 0)
             _trace("writes: responded")
         for t in texts:
             self.ack(t)
@@ -896,106 +994,111 @@ class BleReceiver(_BleBase):
 
     # --- BLE
     def start(self):
-        from objc_util import nsdata_to_bytes
-        self._bytes = nsdata_to_bytes
         _trace_start("receiver")
         self.on_log("BLE 受信を開始します（版 %s）" % BLE_VERSION)
         _ACTIVE["receiver"] = self
         self.delegate = _delegate("ECGBleReceiver", _RECEIVER_METHODS,
                                   ["CBCentralManagerDelegate", "CBPeripheralDelegate"])
         self.running = True
-        self.cm = _cb("CBCentralManager").alloc().initWithDelegate_queue_(self.delegate, None)
+        self.cm = _new("CBCentralManager", "initWithDelegate:queue:", "@@@", _ptr_of(self.delegate), None)
 
     def stop(self):
         self.running = False
-        if self.cm is not None:
-            self.cm.stopScan()
-            if self.per is not None:
-                self.cm.cancelPeripheralConnection_(self.per)
-            self.cm.setDelegate_(None)
+        if self.cm:
+            _send(self.cm, "stopScan", "v")
+            if self.per:
+                _send(self.cm, "cancelPeripheralConnection:", "v@", self.per)
+            _send(self.cm, "setDelegate:", "v@", None)
+            _release(self.cm)
             self.cm = None
-        self.per = None
+        self._forget()
         if _ACTIVE.get("receiver") is self:
             del _ACTIVE["receiver"]
 
+    def _forget(self):
+        """接続していた iPad の情報を手放す。"""
+        for p in (self.per, self.data_char, self.ack_char):
+            _release(p)
+        self.per = self.data_char = self.ack_char = None
+
     def _scan(self):
-        from objc_util import ns
-        if self.running and self.cm is not None and self.per is None:
-            self.cm.scanForPeripheralsWithServices_options_(ns([_uuid(SERVICE_UUID)]), None)
+        if self.running and self.cm and not self.per:
+            _send(self.cm, "scanForPeripheralsWithServices:options:", "v@@", _nsarray([_uuid(SERVICE_UUID)]), None)
 
     def _state(self, cm):
-        st = cm.state()
+        st = _send(cm, "state", "q")
         if st == 5:
             self.on_log("BLE 受信待機中（iPad の「送信」を待っています）")
             self._scan()
         else:
             self.on_log("Bluetooth: %s　%s" % (_BT_STATE.get(st, st), _bt_hint(st)))
 
-    def _found(self, p, adv=None):
-        if self.per is not None:
+    def _found(self, p):
+        if self.per:
             return
-        self.cm.stopScan()
-        self.per = p
-        p.setDelegate_(self.delegate)
-        self.on_log("iPad を見つけました（%s）。接続しています…" % (p.name() or BLE_NAME))
-        self.cm.connectPeripheral_options_(p, None)
+        _send(self.cm, "stopScan", "v")
+        self.per = _retain(p)   # 接続中は参照を持っておく（持たないと iOS が接続を切る）
+        _send(p, "setDelegate:", "v@", _ptr_of(self.delegate))
+        self.on_log("iPad を見つけました（%s）。接続しています…" % (_str(_send(p, "name", "@")) or BLE_NAME))
+        _send(self.cm, "connectPeripheral:options:", "v@@", p, None)
         self._watch = p
         _later(CONNECT_TIMEOUT, self._check_watchdog)
 
     def _check_watchdog(self):
         p, self._watch = self._watch, None
-        if p is not None and self.per is p and self.data_char is None and not self.asm.active and self.cm is not None:
+        if p and p == self.per and not self.data_char and not self.asm.active and self.cm:
             self.on_log("iPad から応答がないため、探し直します")
-            self.cm.cancelPeripheralConnection_(p)
+            _send(self.cm, "cancelPeripheralConnection:", "v@", p)
 
     def _connected(self, p):
-        from objc_util import ns
-        p.discoverServices_(ns([_uuid(SERVICE_UUID)]))
+        _send(p, "discoverServices:", "v@", _nsarray([_uuid(SERVICE_UUID)]))
 
     def _services(self, p):
-        for svc in (p.services() or []):
+        for svc in _items(_send(p, "services", "@")):
             if _uuid_of(svc) == SERVICE_UUID:
-                p.discoverCharacteristics_forService_(None, svc)
+                _send(p, "discoverCharacteristics:forService:", "v@@", None, svc)
                 return
         self.on_log("%s は送信の準備ができていません（iPad で ecg_sender_ipad.py を起動してください）"
-                    % (p.name() or "機器"))
-        self.cm.cancelPeripheralConnection_(p)
+                    % (_str(_send(p, "name", "@")) or "機器"))
+        _send(self.cm, "cancelPeripheralConnection:", "v@", p)
 
     def _chars(self, p, svc):
-        for ch in (svc.characteristics() or []):
+        for ch in _items(_send(svc, "characteristics", "@")):
             u = _uuid_of(ch)
-            if u == DATA_UUID:
-                self.data_char = ch
-            elif u == ACK_UUID:
-                self.ack_char = ch
-        if self.data_char is not None and self.ack_char is not None:
-            p.setNotifyValue_forCharacteristic_(True, self.data_char)
+            if u == DATA_UUID and not self.data_char:
+                self.data_char = _retain(ch)
+            elif u == ACK_UUID and not self.ack_char:
+                self.ack_char = _retain(ch)
+        if self.data_char and self.ack_char:
+            _send(p, "setNotifyValue:forCharacteristic:", "vB@", True, self.data_char)
         else:
             self.on_log("iPad の BLE サービスが不完全です")
-            self.cm.cancelPeripheralConnection_(p)
+            _send(self.cm, "cancelPeripheralConnection:", "v@", p)
 
     def _subscribed(self, err):
         if err:
-            self.on_log("iPad の通知を受け取れません: %s" % err)
-            if self.per is not None:
-                self.cm.cancelPeripheralConnection_(self.per)
+            self.on_log("iPad の通知を受け取れません: %s" % _err_text(err))
+            if self.per:
+                _send(self.cm, "cancelPeripheralConnection:", "v@", self.per)
         else:
             self.on_log("iPad に接続しました。受信を待っています…")
 
     def _value(self, ch):
-        if _uuid_of(ch) != DATA_UUID or ch.value() is None:
+        if _uuid_of(ch) != DATA_UUID:
             return
-        reply = self.receive(self._bytes(ch.value()))
-        if reply is not None and self.per is not None and self.ack_char is not None:
-            from objc_util import ns
-            self.per.writeValue_forCharacteristic_type_(ns(reply), self.ack_char, 0)  # 0＝応答あり
+        value = _send(ch, "value", "@")
+        if not value:
+            return
+        reply = self.receive(_bytes_of(value))
+        if reply is not None and self.per and self.ack_char:
+            _send(self.per, "writeValue:forCharacteristic:type:", "v@@q", _nsdata(reply), self.ack_char, 0)  # 0＝応答あり
         got = self.take_file()
         if got:
             self.on_file(*got)
 
     def _written(self):
-        if self.per is not None and not self.asm.active:
-            self.cm.cancelPeripheralConnection_(self.per)  # 1ファイル受け取ったら切断して次を待つ
+        if self.per and not self.asm.active:
+            _send(self.cm, "cancelPeripheralConnection:", "v@", self.per)  # 1ファイル受け取ったら切断して次を待つ
 
     def _failed(self):
         self._lost("接続できませんでした")
@@ -1012,8 +1115,7 @@ class BleReceiver(_BleBase):
             self.on_log(why)
         self._just_done = False
         self.asm.reset()
-        self.per = None
-        self.data_char = self.ack_char = None
+        self._forget()
         self._scan()
 
 import types as _types

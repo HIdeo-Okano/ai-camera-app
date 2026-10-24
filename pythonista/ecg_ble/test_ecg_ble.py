@@ -38,6 +38,8 @@ sys.path.insert(0, HERE)
 import ecg_sender_ipad as tx      # noqa: E402
 import ecg_viewer_iphone as rx    # noqa: E402
 
+_REAL_SEND = tx._send   # 模擬に差し替える前の本物（SendMarshallingTest で使う）
+
 CSV = sys.argv[1] if len(sys.argv) > 1 and os.path.exists(sys.argv[1]) else os.path.join(HERE, "ECGtsHDdata1.csv")
 
 
@@ -453,16 +455,26 @@ class FSvc(object):
         return FObj(u)
 
 
+def _fake_send(obj, sel, sig, *args):
+    """_send の代わり：セレクタ名をメソッド名にして模擬オブジェクトを呼ぶ。"""
+    assert sig[0] in "@BqQ*v" and all(c in "@BqQ*" for c in sig[1:]), sig
+    assert sig.count("@") + sig.count("B") + sig.count("q") + sig.count("Q") + sig.count("*") - 1 == len(args) \
+        or (sig[0] == "v" and len(sig) - 1 == len(args)), (sel, sig, args)
+    assert sel.count(":") == len(args), (sel, args)   # セレクタの引数の数と合っているか
+    return getattr(obj, sel.replace(":", "_"))(*args)
+
+
+def _fake_items(a):
+    if a is None:
+        return []
+    return list(a.reqs) if isinstance(a, FReqs) else list(a)
+
+
 def _install_fake_objc():
     m = types.ModuleType("objc_util")
     classes = {"CBUUID": FCBUUID, "CBPeripheralManager": _Alloc(FPM), "CBCentralManager": _Alloc(FCM),
                "CBMutableService": _Alloc(FSvc), "CBMutableCharacteristic": _Alloc(FChar)}
-    m.ObjCClass = lambda n: classes[n]
-    m.ObjCInstance = lambda x: x
-    m.ns = lambda x: x
-    m.nsdata_to_bytes = lambda x: bytes(x)
     m.load_framework = lambda n: None
-    m.on_main_thread = lambda f: (lambda: W[0].on_main(f))
 
     def create_objc_class(name, methods=(), protocols=()):
         for f in methods:
@@ -479,7 +491,19 @@ def _install_fake_objc():
     m.create_objc_class = create_objc_class
     sys.modules["objc_util"] = m
     for mod in (tx, rx):
-        mod._CB.clear()
+        mod._send = _fake_send
+        mod._cls = classes.__getitem__
+        mod._retain = lambda p: p
+        mod._release = lambda p: None
+        mod._nsstr = lambda s: s
+        mod._str = lambda p: None if p is None else str(p)
+        mod._nsdata = bytes
+        mod._bytes_of = lambda p: bytes(p) if p else b""
+        mod._nsarray = list
+        mod._nsdict = dict
+        mod._items = _fake_items
+        mod._err_text = str
+        mod._ptr_of = lambda o: o
         # タイマーは記録だけして、テストの中で W[0].fire() で時間を進める。
         # 引数付きの呼び出しは Pythonista で失敗したので、(sec, fn) 以外は受け付けない
         mod._later = _fake_later
@@ -489,6 +513,53 @@ def _fake_later(sec, fn):
     # iPad では、ボタン用の別スレッドから予約した直後に Pythonista が落ちた（実機で発生）
     assert W[0].main > 0, "_later はメインスレッドから呼ぶこと: %s" % fn.__name__
     W[0].timers.append((sec, fn))
+
+
+class SendMarshallingTest(unittest.TestCase):
+    """_send が呼び出しの型ごとに専用の関数を作り、引数を正しい型・順番で渡すことを、
+    objc_msgSend の代わりの ctypes コールバックで確かめる。"""
+
+    def run_sig(self, sig, ret, *args):
+        import ctypes
+        seen = []
+        types_ = {"@": ctypes.c_void_p, "B": ctypes.c_bool, "q": ctypes.c_longlong, "Q": ctypes.c_ulonglong,
+                  "*": ctypes.c_char_p, "v": None}
+        proto = ctypes.CFUNCTYPE(types_[sig[0]], ctypes.c_void_p, ctypes.c_void_p, *[types_[c] for c in sig[1:]])
+
+        def fake_msg(obj, sel, *a):
+            seen.append((obj, sel) + a)
+            return ret
+        cb = proto(fake_msg)
+        tx._RT.clear()
+        tx._RT.update(fns={}, sels={}, classes={}, msg=ctypes.cast(cb, ctypes.c_void_p).value,
+                      reg_sel=lambda b: 4242, get_class=lambda b: 77)
+        try:
+            out = _REAL_SEND(1234, "x" + ":" * (len(sig) - 1), sig, *args)
+        finally:
+            tx._RT.clear()
+        return out, seen[0]
+
+    def test_signatures(self):
+        out, seen = self.run_sig("@@", 99, 555)
+        self.assertEqual((out, seen), (99, (1234, 4242, 555)))
+        out, seen = self.run_sig("B@@@", True, 1, 2, None)
+        self.assertEqual((out, seen), (True, (1234, 4242, 1, 2, None)))
+        out, seen = self.run_sig("v@q", None, 7, -3)
+        self.assertEqual((out, seen), (None, (1234, 4242, 7, -3)))
+        out, seen = self.run_sig("@*Q", 5, b"ab", 2)
+        self.assertEqual((out, seen), (5, (1234, 4242, b"ab", 2)))
+        out, seen = self.run_sig("q", 5, )
+        self.assertEqual((out, seen), (5, (1234, 4242)))
+
+    def test_no_objc_util_method_calls(self):
+        """BLE の部分は objc_util の ObjCInstance・ns などを使わない（使うのはデリゲートのクラス作成だけ）。"""
+        with open(os.path.join(HERE, "ecg_ble_section.py"), encoding="utf-8") as f:
+            code = [ln for ln in f.read().splitlines() if not ln.lstrip().startswith("#")]
+        imports = [ln.strip() for ln in code if "from objc_util import" in ln]
+        self.assertEqual(sorted(set(imports)), ["from objc_util import create_objc_class",
+                                                "from objc_util import load_framework"])
+        for word in ("ObjCInstance(", "ObjCClass(", "ns(", "nsdata_to_bytes", "on_main_thread", ".alloc()"):
+            self.assertFalse([ln for ln in code if word in ln], word)
 
 
 class CoreBluetoothFlowTest(unittest.TestCase):
