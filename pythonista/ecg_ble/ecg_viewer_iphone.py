@@ -341,7 +341,7 @@ SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
 BLE_NAME = "ECG-TX"
-BLE_VERSION = "2026-10-25 r12"     # 起動時に表示（どのファイルが動いているか確かめるため）
+BLE_VERSION = "2026-10-25 r13"     # 起動時に表示（どのファイルが動いているか確かめるため）
 # 受信側（iPhone）はサービス UUID だけで iPad を探す（iPad の端末名は使わない）。
 # 名前で全機器を探す処理（サービスを指定しないスキャン）は、Pythonista で
 # ArgumentError になり、iPad 本体に何度もつなぎ直す原因にもなったため使わない。
@@ -745,6 +745,8 @@ class BleSender(_BleBase):
         self.pm = None
         self.ready = False
         self.data_char = None
+        self._ack_char = None    # サービスと特性は iOS が使い続けるので、閉じるまで手放さない
+        self._svc = None
         self.job = None
         self._timeout_job = None
         self._central = None     # 接続して通知を待っている iPhone
@@ -810,6 +812,9 @@ class BleSender(_BleBase):
             _send(self.pm, "setDelegate:", "v@", None)
             _release(self.pm)
             self.pm = None
+        for p in (self.data_char, self._ack_char, self._svc):   # iOS から外した後で手放す
+            _release(p)
+        self.data_char = self._ack_char = self._svc = None
         _release(self._central)
         self._central = None
         if _ACTIVE.get("sender") is self:
@@ -865,17 +870,20 @@ class BleSender(_BleBase):
             if _bt_hint(st):
                 self.on_log(_bt_hint(st))
             return
-        _release(self.data_char)
-        self.data_char = _new("CBMutableCharacteristic", "initWithType:properties:value:permissions:", "@@Q@Q",
-                              _uuid(DATA_UUID), 0x10, None, 0x01)            # Notify / Readable
+        old = (self.data_char, self._ack_char, self._svc)
+        data_char = _new("CBMutableCharacteristic", "initWithType:properties:value:permissions:", "@@Q@Q",
+                         _uuid(DATA_UUID), 0x10, None, 0x01)            # Notify / Readable
         ack_char = _new("CBMutableCharacteristic", "initWithType:properties:value:permissions:", "@@Q@Q",
-                        _uuid(ACK_UUID), 0x08, None, 0x02)                   # Write / Writeable
+                        _uuid(ACK_UUID), 0x08, None, 0x02)              # Write / Writeable
         svc = _new("CBMutableService", "initWithType:primary:", "@@B", _uuid(SERVICE_UUID), True)
-        _send(svc, "setCharacteristics:", "v@", _nsarray([self.data_char, ack_char]))
+        _send(svc, "setCharacteristics:", "v@", _nsarray([data_char, ack_char]))
         _send(pm, "removeAllServices", "v")
         _send(pm, "addService:", "v@", svc)
-        _release(ack_char)   # サービスと PeripheralManager が持っている
-        _release(svc)
+        # 登録したサービス・特性は手放さない（r12 では登録直後に手放したため、iPhone が中身を
+        # 確かめに来た時に解放済みになり、サービスが見えないうえ iPad が落ちた）
+        self.data_char, self._ack_char, self._svc = data_char, ack_char, svc
+        for p in old:   # 前に登録していたものは removeAllServices で外したので手放してよい
+            _release(p)
 
     def _added(self, err):
         if err:

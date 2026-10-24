@@ -302,6 +302,7 @@ class FPM(object):
         if w.full_every and w.n_update % w.full_every == 0:
             w.call(self.d, "peripheralManagerIsReadyToUpdateSubscribers_", self)
             return False
+        _alive(ch, "通知する特性")
         rch = w.remote.char(ch.uuid.s)
         d = w.remote.d
 
@@ -336,6 +337,9 @@ class FRemote(object):
         if self.pm is None or self.pm.svc is None:   # iPad でアプリが動いていない
             self.svcs = []
         else:
+            _alive(self.pm.svc, "サービス")
+            for c in self.pm.svc.chars:
+                _alive(c, "特性")
             svc = FObj(self.pm.svc.uuid)
             svc.chars = [FObj(c.uuid) for c in self.pm.svc.chars]
             self.svcs = [svc]
@@ -445,14 +449,36 @@ class FCBUUID(object):
         return FUUID(s)
 
 
+def _owned(obj):
+    obj.rc = 1   # alloc/init したものは参照 1 で始まる
+    return obj
+
+
+def _alive(obj, what):
+    # 実機（r12）では、登録直後に手放したサービスを iOS が使って iPad が落ちた
+    assert getattr(obj, "rc", 1) > 0, "%s が手放された後に iOS から使われました" % what
+
+
 class FChar(object):
     def initWithType_properties_value_permissions_(self, u, props, v, perms):
-        return FObj(u)
+        return _owned(FObj(u))
 
 
 class FSvc(object):
     def initWithType_primary_(self, u, primary):
-        return FObj(u)
+        return _owned(FObj(u))
+
+
+def _fake_retain(p):
+    if p is not None and hasattr(p, "rc"):
+        p.rc += 1
+    return p
+
+
+def _fake_release(p):
+    if p is not None and hasattr(p, "rc"):
+        p.rc -= 1
+        assert p.rc >= 0, "手放しすぎ"
 
 
 def _fake_send(obj, sel, sig, *args):
@@ -493,8 +519,8 @@ def _install_fake_objc():
     for mod in (tx, rx):
         mod._send = _fake_send
         mod._cls = classes.__getitem__
-        mod._retain = lambda p: p
-        mod._release = lambda p: None
+        mod._retain = _fake_retain
+        mod._release = _fake_release
         mod._nsstr = lambda s: s
         mod._str = lambda p: None if p is None else str(p)
         mod._nsdata = bytes
