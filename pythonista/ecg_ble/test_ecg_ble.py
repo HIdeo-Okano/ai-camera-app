@@ -148,5 +148,361 @@ class BleTest(unittest.TestCase):
         self.assertEqual(os.listdir(self.tmp), ["evil.csv"])
 
 
+# ---------------------------------------------------------------- 模擬 CoreBluetooth（objc_util の代わり）
+class World(object):
+    """iPad（ペリフェラル）と iPhone（セントラル）の BLE イベントを順番に配送する。"""
+
+    def __init__(self, full_every=0, hide_service=False):
+        self.hide_service = hide_service  # True: アドバタイズにサービス UUID が載らない（名前でしか見つからない）
+        self.q = []
+        self.pm = self.cm = None
+        self.remote = None
+        self.full_every = full_every
+        self.n_update = 0
+        self.advertising = False
+
+    def call(self, delegate, name, *args):
+        self.q.append(lambda: delegate.methods[name](None, None, *args))
+
+    def run(self, limit=200000):
+        for _ in range(limit):
+            if not self.q:
+                return
+            self.q.pop(0)()
+        raise AssertionError("イベントが終わりません")
+
+
+W = [None]
+
+
+class FUUID(object):
+    def __init__(self, s):
+        self.s = s.upper()
+
+    def UUIDString(self):
+        return self.s
+
+
+class FObj(object):
+    def __init__(self, uuid):
+        self.uuid = uuid
+        self.chars = []
+        self.val = None
+
+    def UUID(self):
+        return self.uuid
+
+    def setCharacteristics_(self, chars):
+        self.chars = list(chars)
+
+    def characteristics(self):
+        return self.chars
+
+    def value(self):
+        return self.val
+
+
+class FReqs(object):
+    def __init__(self, reqs):
+        self.reqs = reqs
+
+    def count(self):
+        return len(self.reqs)
+
+    def objectAtIndex_(self, i):
+        return self.reqs[i]
+
+
+class FReq(object):
+    def __init__(self, ch, data):
+        self.ch, self.data = ch, data
+
+    def characteristic(self):
+        return self.ch
+
+    def value(self):
+        return self.data
+
+
+class FCentral(object):
+    def maximumUpdateValueLength(self):
+        return 182
+
+
+class FPM(object):
+    def initWithDelegate_queue_(self, d, q):
+        self.d = d
+        self.svc = None
+        W[0].pm = self
+        W[0].call(d, "peripheralManagerDidUpdateState_", self)
+        return self
+
+    def state(self):
+        return 5
+
+    def removeAllServices(self):
+        self.svc = None
+
+    def addService_(self, svc):
+        self.svc = svc
+        W[0].call(self.d, "peripheralManager_didAddService_error_", self, svc, None)
+
+    def startAdvertising_(self, adv):
+        assert adv["kCBAdvDataServiceUUIDs"][0].UUIDString() == tx.core.SERVICE_UUID
+        W[0].advertising = True
+        W[0].call(self.d, "peripheralManagerDidStartAdvertising_error_", self, None)
+        cm = W[0].cm
+        if cm and cm.scanning:
+            cm.discover()
+
+    def stopAdvertising(self):
+        W[0].advertising = False
+
+    def updateValue_forCharacteristic_onSubscribedCentrals_(self, data, ch, centrals):
+        w = W[0]
+        w.n_update += 1
+        if w.full_every and w.n_update % w.full_every == 0:
+            w.call(self.d, "peripheralManagerIsReadyToUpdateSubscribers_", self)
+            return False
+        rch = w.remote.char(ch.uuid.s)
+        d = w.remote.d
+
+        def deliver(v=bytes(data)):  # 実機と同じく、通知ごとに value を更新してからデリゲートを呼ぶ
+            rch.val = v
+            d.methods["peripheral_didUpdateValueForCharacteristic_error_"](None, None, w.remote, rch, None)
+        w.q.append(deliver)
+        return True
+
+    def respondToRequest_withResult_(self, req, res):
+        pass
+
+    def setDelegate_(self, d):
+        pass
+
+
+class FRemote(object):
+    """iPhone から見た iPad（CBPeripheral）"""
+
+    def __init__(self, pm):
+        self.pm = pm
+        self.d = None
+        self.svcs = []
+        for c in pm.svc.chars:
+            pass
+
+    def name(self):
+        return "TB016"
+
+    def setDelegate_(self, d):
+        self.d = d
+
+    def discoverServices_(self, uuids):
+        svc = FObj(self.pm.svc.uuid)
+        svc.chars = [FObj(c.uuid) for c in self.pm.svc.chars]
+        self.svcs = [svc]
+        W[0].call(self.d, "peripheral_didDiscoverServices_", self, None)
+
+    def services(self):
+        return self.svcs
+
+    def char(self, u):
+        return [c for c in self.svcs[0].chars if c.uuid.s == u][0]
+
+    def discoverCharacteristics_forService_(self, uuids, svc):
+        W[0].call(self.d, "peripheral_didDiscoverCharacteristicsForService_error_", self, svc, None)
+
+    def setNotifyValue_forCharacteristic_(self, on, ch):
+        w = W[0]
+        w.call(self.d, "peripheral_didUpdateNotificationStateForCharacteristic_error_", self, ch, None)
+        local = [c for c in self.pm.svc.chars if c.uuid.s == ch.uuid.s][0]
+        w.call(self.pm.d, "peripheralManager_central_didSubscribeToCharacteristic_", self.pm, FCentral(), local)
+
+    def writeValue_forCharacteristic_type_(self, data, ch, kind):
+        assert kind == 0
+        w = W[0]
+        local = [c for c in self.pm.svc.chars if c.uuid.s == ch.uuid.s][0]
+        w.call(self.pm.d, "peripheralManager_didReceiveWriteRequests_", self.pm, FReqs([FReq(local, bytes(data))]))
+        w.call(self.d, "peripheral_didWriteValueForCharacteristic_error_", self, ch, None)
+
+
+class FAdv(object):
+    def __init__(self, local_name):
+        self.local_name = local_name
+
+    def objectForKey_(self, k):
+        return self.local_name if k == "kCBAdvDataLocalName" else None
+
+
+class FOther(object):
+    def name(self):
+        return "smarlife(2)"
+
+
+class FCM(object):
+    def initWithDelegate_queue_(self, d, q):
+        self.d = d
+        self.scanning = False
+        W[0].cm = self
+        W[0].call(d, "centralManagerDidUpdateState_", self)
+        return self
+
+    def state(self):
+        return 5
+
+    def scanForPeripheralsWithServices_options_(self, uuids, opt):
+        self.filtered = uuids is not None
+        if self.filtered:
+            assert uuids[0].UUIDString() == tx.core.SERVICE_UUID
+        self.scanning = True
+        if W[0].advertising:
+            self.discover()
+
+    def discover(self):
+        w = W[0]
+        if self.filtered and w.hide_service:
+            return
+        if not self.filtered:  # 名前で探すときは、関係ない機器も見つかる
+            w.call(self.d, "centralManager_didDiscoverPeripheral_advertisementData_RSSI_", self, FOther(), FAdv(None), -60)
+        w.remote = FRemote(w.pm)
+        w.call(self.d, "centralManager_didDiscoverPeripheral_advertisementData_RSSI_", self, w.remote,
+               FAdv(tx.core.BLE_NAME), -50)
+
+    def stopScan(self):
+        self.scanning = False
+
+    def connectPeripheral_options_(self, p, opt):
+        W[0].call(self.d, "centralManager_didConnectPeripheral_", self, p)
+
+    def cancelPeripheralConnection_(self, p):
+        w = W[0]
+        w.call(self.d, "centralManager_didDisconnectPeripheral_error_", self, p, None)
+        dc = [c for c in w.pm.svc.chars if c.uuid.s == tx.core.DATA_UUID][0]
+        w.call(w.pm.d, "peripheralManager_central_didUnsubscribeFromCharacteristic_", w.pm, FCentral(), dc)
+
+    def setDelegate_(self, d):
+        pass
+
+
+class _Alloc(object):
+    def __init__(self, make):
+        self.make = make
+
+    def alloc(self):
+        return self.make()
+
+
+class FCBUUID(object):
+    @staticmethod
+    def UUIDWithString_(s):
+        return FUUID(s)
+
+
+class FChar(object):
+    def initWithType_properties_value_permissions_(self, u, props, v, perms):
+        return FObj(u)
+
+
+class FSvc(object):
+    def initWithType_primary_(self, u, primary):
+        return FObj(u)
+
+
+def _install_fake_objc():
+    m = types.ModuleType("objc_util")
+    classes = {"CBUUID": FCBUUID, "CBPeripheralManager": _Alloc(FPM), "CBCentralManager": _Alloc(FCM),
+               "CBMutableService": _Alloc(FSvc), "CBMutableCharacteristic": _Alloc(FChar)}
+    m.ObjCClass = lambda n: classes[n]
+    m.ObjCInstance = lambda x: x
+    m.ns = lambda x: x
+    m.nsdata_to_bytes = lambda x: bytes(x)
+    m.load_framework = lambda n: None
+    m.on_main_thread = lambda f: f
+
+    def create_objc_class(name, methods=(), protocols=()):
+        for f in methods:
+            assert isinstance(getattr(f, "encoding", ""), str), f.__name__
+            # 引数の数がエンコーディング（戻り値・self・_cmd を除く @ の数）と合っているか
+            assert f.__code__.co_argcount == len(f.encoding) - 1, f.__name__
+
+        class D(object):
+            pass
+        D.new = staticmethod(lambda: types.SimpleNamespace(methods={f.__name__: f for f in methods}))
+        return D
+    m.create_objc_class = create_objc_class
+    sys.modules["objc_util"] = m
+    for mod in (tx, rx):
+        mod._CB.clear()
+        mod._later = lambda sec, fn: None   # タイムアウト用タイマーは使わない
+
+
+class CoreBluetoothFlowTest(unittest.TestCase):
+    """BleSender.start() / BleReceiver.start() のデリゲート処理を、模擬 CoreBluetooth で通しで動かす。"""
+
+    def setUp(self):
+        _install_fake_objc()
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+        sys.modules.pop("objc_util", None)
+
+    def flow(self, iphone_first, full_every=0, hide_service=False):
+        W[0] = World(full_every, hide_service)
+        logs, done, files = [], [], []
+        snd = tx.core.BleSender(lambda m: logs.append("iPad: " + m), lambda ok, msg: done.append((ok, msg)))
+        rcv = rx.core.BleReceiver(self.tmp, lambda p, f: files.append((p, f)), lambda m: logs.append("iPhone: " + m))
+        name, raw = sample_csv()
+        if iphone_first:
+            rcv.start()
+            W[0].run()
+            snd.start()
+        else:
+            snd.start()
+            W[0].run()
+            rcv.start()
+        W[0].run()
+        snd.send(name, raw, "4")
+        W[0].run()
+        if hide_service:
+            self.assertEqual(done, [])               # サービス UUID では見つからない
+            rcv._wide_scan(rcv._scan_no)            # WIDE_SCAN_AFTER 秒後に名前でも探す
+            W[0].run()
+        errors = [m for m in logs if "エラー" in m]
+        self.assertEqual(errors, [], "\n".join(logs))
+        self.assertEqual(done, [(True, name)], "\n".join(logs))
+        self.assertEqual(len(files), 1)
+        with open(files[0][0], "rb") as f:
+            self.assertEqual(f.read(), raw)
+        self.assertFalse(W[0].advertising)                 # 送信後はアドバタイズを止める
+        self.assertTrue(W[0].cm.scanning)                  # iPhone は次の送信を待って探し続ける
+        return logs
+
+    def test_flow_iphone_started_first(self):
+        self.flow(True)
+
+    def test_flow_ipad_started_first_with_full_queue(self):
+        self.flow(False, full_every=5)
+
+    def test_flow_found_by_name_when_service_not_advertised(self):
+        logs = self.flow(True, hide_service=True)
+        self.assertTrue(any("TB016" in m for m in logs), "\n".join(logs))
+
+    def test_send_twice(self):
+        logs = self.flow(True)
+        name, raw = sample_csv()
+        done = []
+        # 2回目の送信（同じ iPad 画面からもう一度「送信」）
+        snd = [o for o in gc_objs() if isinstance(o, tx.core.BleSender)][-1]
+        snd.on_done = lambda ok, msg: done.append((ok, msg))
+        snd.send(name, raw, "4")
+        W[0].run()
+        self.assertEqual(done, [(True, name)], "\n".join(logs))
+
+
+def gc_objs():
+    import gc
+    return gc.get_objects()
+
+
 if __name__ == "__main__":
     unittest.main(argv=sys.argv[:1], verbosity=2)
