@@ -54,6 +54,8 @@ class FakePeripheral(object):
         pass
 
     def write_characteristic_value(self, c, packet, with_response):
+        if getattr(self, 'buggy_cb', False):  # Pythonista 3.4 の cb の不具合を再現
+            raise SystemError('PY_SSIZE_T_CLEAN macro must be defined for \'#\' formats')
         self.queue.append(lambda: self._write(c, packet, with_response))
 
     def _write(self, c, packet, with_response):
@@ -131,6 +133,26 @@ class ProtocolTest(unittest.TestCase):
                 break
         self.assertTrue(sender.done.is_set())
         return sender
+
+    def test_objc_fallback_when_cb_write_is_broken(self):
+        calls = []
+
+        def fake_objc_write(p, c, packet):
+            calls.append(packet)
+            p.queue.append(lambda: p._write(c, packet, True))
+
+        orig = tx._objc_write
+        tx._objc_write = fake_objc_write
+        FakePeripheral.buggy_cb = True
+        try:
+            data = b'1,2\n' * 300
+            sender = self.run_transfer('c.csv', data)
+        finally:
+            tx._objc_write = orig
+            del FakePeripheral.buggy_cb
+            tx._use_objc_write = False
+        self.assertEqual(sender.result, 'OK:c.csv')
+        self.assertEqual(len(calls), len(tx.build_packets('c.csv', data)))
 
     def test_ipad_with_custom_name_found_by_service(self):
         data = b't,ecg\n' + b'0.001,0.12\n' * 200

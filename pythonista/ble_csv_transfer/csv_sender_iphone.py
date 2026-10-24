@@ -54,6 +54,44 @@ def is_hint(name):
     return any(h.lower() in name for h in NAME_HINTS)
 
 
+_use_objc_write = False
+
+
+def ble_write(peripheral, characteristic, data):
+    """Write with response で 1 パケット書き込む。
+
+    Pythonista 3.4 (Python 3.10) では cb の write_characteristic_value が
+    「PY_SSIZE_T_CLEAN macro must be defined」エラーになるため、
+    その場合は objc_util で CoreBluetooth を直接呼び出す。
+    """
+    global _use_objc_write
+    if not _use_objc_write:
+        try:
+            peripheral.write_characteristic_value(characteristic, data, True)
+            return
+        except SystemError as e:
+            if 'PY_SSIZE_T_CLEAN' not in str(e):
+                raise
+            _use_objc_write = True
+    _objc_write(peripheral, characteristic, data)
+
+
+def _objc_ptr(obj):
+    for attr in ('ptr', '_ptr', 'objc_ptr'):
+        value = getattr(obj, attr, None)
+        if value:
+            return value
+    raise RuntimeError('CoreBluetooth オブジェクトを取得できません (%s の属性: %s)'
+                       % (type(obj).__name__, [a for a in dir(obj) if not a.startswith('__')]))
+
+
+def _objc_write(peripheral, characteristic, data):
+    from objc_util import ObjCInstance, ns
+    p = ObjCInstance(_objc_ptr(peripheral))
+    c = ObjCInstance(_objc_ptr(characteristic))
+    p.writeValue_forCharacteristic_type_(ns(bytes(data)), c, 0)  # 0 = CBCharacteristicWriteWithResponse
+
+
 def build_packets(name, data):
     """ファイル名とデータから送信パケット列を作る (BLE に依存しない部分)"""
     crc = zlib.crc32(data) & 0xFFFFFFFF
@@ -209,7 +247,10 @@ class Sender(object):
             self.log('全データ送信済み。iPad の検証結果を待っています...')
             return
         # Write with response: 応答 (did_write_value) を待ってから次を送ることで取りこぼしを防ぐ
-        self.peripheral.write_characteristic_value(self.data_char, self.packets[self.index], True)
+        try:
+            ble_write(self.peripheral, self.data_char, self.packets[self.index])
+        except Exception as e:
+            self.finish('ERR:書き込みに失敗しました (%s)' % e)
 
     def did_write_value(self, c, error):
         if error:
