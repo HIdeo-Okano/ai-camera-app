@@ -339,7 +339,7 @@ SERVICE_UUID = "8F1D0001-2C5A-4E7B-9A63-5E0C6A1B2D01"
 DATA_UUID = "8F1D0002-2C5A-4E7B-9A63-5E0C6A1B2D01"     # iPad → iPhone（Notify）
 ACK_UUID = "8F1D0003-2C5A-4E7B-9A63-5E0C6A1B2D01"      # iPhone → iPad（Write）
 BLE_NAME = "ECG-TX"
-BLE_VERSION = "2026-10-25 r9"     # 起動時に表示（どのファイルが動いているか確かめるため）
+BLE_VERSION = "2026-10-25 r10"     # 起動時に表示（どのファイルが動いているか確かめるため）
 # 受信側（iPhone）はサービス UUID だけで iPad を探す（iPad の端末名は使わない）。
 # 名前で全機器を探す処理（サービスを指定しないスキャン）は、Pythonista で
 # ArgumentError になり、iPad 本体に何度もつなぎ直す原因にもなったため使わない。
@@ -455,10 +455,41 @@ def _delegate(base, methods, protocols):
     return create_objc_class(name, methods=methods, protocols=protocols).new()
 
 
+# ----- 動作記録（落ちた場所を調べるため）
+#   1つ処理するごとに Documents/ecg_ble_trace_<sender|receiver>.txt へ書いてすぐ保存する。
+#   Pythonista が落ちてもファイルは残るので、最後の行が「落ちる直前の処理」になる。
+TRACE_DIR = os.path.expanduser("~/Documents")
+_TRACE = {"path": None}
+
+
+def _trace_start(role):
+    _TRACE["path"] = os.path.join(TRACE_DIR, "ecg_ble_trace_%s.txt" % role)
+    try:
+        with open(_TRACE["path"], "w", encoding="utf-8") as f:
+            f.write("ECG BLE 動作記録（%s・版 %s）\n" % (role, BLE_VERSION))
+    except Exception:
+        _TRACE["path"] = None
+
+
+def _trace(msg):
+    path = _TRACE["path"]
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
 def _main(fn):
     """CoreBluetooth の操作はメインスレッドで行う。fn は引数なしで呼ぶ。"""
     from objc_util import on_main_thread
+    _trace("main> %s" % fn.__name__)
     on_main_thread(fn)()
+    _trace("main< %s" % fn.__name__)
 
 
 def _later(sec, fn):
@@ -467,6 +498,7 @@ def _later(sec, fn):
     また引数を付けて on_main_thread に渡すと ArgumentError やクラッシュになったため、
     引数は渡さず、必要な値はオブジェクトに持たせておく。"""
     import ui
+    _trace("later %s %ss" % (fn.__name__, sec))
     ui.delay(fn, sec)
 
 
@@ -499,8 +531,10 @@ def _call(h, name, ptrs):
 
 def _dispatch(role, name, *ptrs):
     h = _ACTIVE.get(role)
+    _trace("> %s" % name)
     if h is not None:
         h._try(_call, h, name, ptrs)
+    _trace("< %s" % name)
 
 
 # 送信側（iPad：ペリフェラル）
@@ -593,6 +627,7 @@ class _BleBase(object):
         self._ui_log = on_log
 
     def on_log(self, m):
+        _trace("log: %s" % m)
         print("[BLE %s] %s" % (time.strftime("%H:%M:%S"), m))  # 画面を閉じた後もコンソールで確認できる
         if self._ui_log:
             self._ui_log(m)
@@ -604,6 +639,7 @@ class _BleBase(object):
         except Exception as e:
             import traceback
             traceback.print_exc()
+            _trace("error: " + traceback.format_exc().replace("\n", " | "))
             self.on_log("BLE エラー: %s: %s" % (type(e).__name__, e))
 
 
@@ -639,7 +675,9 @@ class BleSender(_BleBase):
             return
         pk = j["packets"]
         while j["i"] < len(pk):
+            _trace("notify %d/%d" % (j["i"] + 1, len(pk)))
             if not notify(pk[j["i"]]):
+                _trace("notify full")
                 return  # 空きができたら peripheralManagerIsReadyToUpdateSubscribers から再開
             j["i"] += 1
             pct = j["i"] * 100 // len(pk)
@@ -656,17 +694,21 @@ class BleSender(_BleBase):
 
     def finish(self, ok, msg):
         """送信を終える。アドバタイズを止め、BLE の準備（サービス）は残して次の「送信」に備える。"""
+        _trace("finish %s" % ok)
         self.job = None
         self._timeout_job = None
         if self.pm is not None:
             self.pm.stopAdvertising()
+            _trace("finish: stopAdvertising done")
         self.on_log("送信を終了しました（%s）。次の「送信」を待っています" % ("成功" if ok else "失敗"))
         self.on_done(ok, msg)
+        _trace("finish: on_done done")
 
     # --- BLE
     def start(self):
         from objc_util import nsdata_to_bytes
         self._bytes = nsdata_to_bytes
+        _trace_start("sender")
         self.on_log("BLE 送信を開始します（版 %s）" % BLE_VERSION)
         _ACTIVE["sender"] = self
         self.delegate = _delegate("ECGBleSender", _SENDER_METHODS, ["CBPeripheralManagerDelegate"])
@@ -784,12 +826,16 @@ class BleSender(_BleBase):
 
     def _writes(self, reqs):
         texts = []
-        for i in range(reqs.count()):
+        n = reqs.count()
+        _trace("writes: %d" % n)
+        for i in range(n):
             r = reqs.objectAtIndex_(i)
             if _uuid_of(r.characteristic()) == ACK_UUID and r.value():
                 texts.append(self._bytes(r.value()).decode("utf-8", "replace"))
-        if reqs.count():
+        _trace("writes: read %r" % texts)
+        if n:
             self.pm.respondToRequest_withResult_(reqs.objectAtIndex_(0), 0)
+            _trace("writes: responded")
         for t in texts:
             self.ack(t)
 
@@ -856,6 +902,7 @@ class BleReceiver(_BleBase):
     def start(self):
         from objc_util import nsdata_to_bytes
         self._bytes = nsdata_to_bytes
+        _trace_start("receiver")
         self.on_log("BLE 受信を開始します（版 %s）" % BLE_VERSION)
         _ACTIVE["receiver"] = self
         self.delegate = _delegate("ECGBleReceiver", _RECEIVER_METHODS,

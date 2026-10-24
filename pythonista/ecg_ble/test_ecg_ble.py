@@ -489,6 +489,8 @@ class CoreBluetoothFlowTest(unittest.TestCase):
     def setUp(self):
         _install_fake_objc()
         self.tmp = tempfile.mkdtemp()
+        for mod in (tx, rx):
+            mod.TRACE_DIR = self.tmp
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
@@ -528,6 +530,15 @@ class CoreBluetoothFlowTest(unittest.TestCase):
 
     def test_flow_ipad_started_first_with_full_queue(self):
         self.flow(False, full_every=5)
+
+    def test_trace_file(self):
+        self.flow(True)
+        with open(os.path.join(self.tmp, "ecg_ble_trace_sender.txt"), encoding="utf-8") as f:
+            trace = f.read()
+        self.assertIn(tx.core.BLE_VERSION, trace)
+        for step in ("> _subscribed", "notify 1/", "> _writes", "writes: responded", "finish True",
+                     "finish: on_done done"):
+            self.assertIn(step, trace)
 
     def test_end_sequence(self):
         logs = self.flow(True)
