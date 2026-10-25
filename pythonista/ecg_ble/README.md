@@ -120,4 +120,4 @@ cd pythonista/ecg_ble
 python3 test_ecg_ble.py [ECGtsHDdata1.csv のパス]
 ```
 
-旧版の `pythonista/ble_csv_transfer/`（iPhone → iPad 方向）は使いません。
+旧版（iPhone → iPad 方向の `pythonista/ble_csv_transfer/`）は削除しました。必要なら Git の履歴から取り出せます。
