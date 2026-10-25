@@ -290,8 +290,10 @@ class FPM(object):
         W[0].advertising = True
         W[0].call(self.d, "peripheralManagerDidStartAdvertising_error_", self, None)
         cm = W[0].cm
-        if cm and cm.scanning:
-            cm.discover()
+        if cm:
+            # iPhone 側の動きはメインの順番待ちで行う（作業スレッドから直接さわると、iPhone 側の
+            # 探索と重なって同じ iPad を 2 回見つけることがある）。その時点でまだ探していれば見つける
+            W[0].q.append(lambda: cm.scanning and cm.discover())
 
     def stopAdvertising(self):
         W[0].advertising = False
@@ -303,12 +305,13 @@ class FPM(object):
             w.call(self.d, "peripheralManagerIsReadyToUpdateSubscribers_", self)
             return False
         _alive(ch, "通知する特性")
-        rch = w.remote.char(ch.uuid.s)
-        d = w.remote.d
+        u = ch.uuid.s
 
         def deliver(v=bytes(data)):  # 実機と同じく、通知ごとに value を更新してからデリゲートを呼ぶ
+            rch = w.remote.char(u)   # iPhone 側の情報はメインで読む（作業スレッドから呼ばれるため）
             rch.val = v
-            w.on_main(d.methods["peripheral_didUpdateValueForCharacteristic_error_"], None, None, w.remote, rch, None)
+            w.on_main(w.remote.d.methods["peripheral_didUpdateValueForCharacteristic_error_"], None, None, w.remote,
+                      rch, None)
         w.q.append(deliver)
         return True
 
@@ -716,6 +719,29 @@ class CoreBluetoothFlowTest(unittest.TestCase):
         self.assertFalse(W[0].advertising)
         self.assertIsNone(snd.job)
 
+    def test_send_before_ble_ready(self):
+        """BLE の準備より先に「送信」を押しても、準備ができたら 1 回だけアドバタイズして送る。"""
+        W[0] = World()
+        logs, done, files = [], [], []
+        adv = []
+        orig = FPM.startAdvertising_
+        FPM.startAdvertising_ = lambda self, d: (adv.append(1), orig(self, d))[1]
+        try:
+            rcv = rx.core.BleReceiver(self.tmp, lambda p, f: files.append((p, f)), logs.append)
+            rcv.start()
+            W[0].run()
+            snd = tx.core.BleSender(logs.append, lambda ok, msg: done.append((ok, msg)), threaded=False)
+            snd.start()
+            name, raw = sample_csv()
+            W[0].on_main(snd.send, name, raw, "4")   # まだサービス登録の通知が来ていない
+            self.assertTrue(any("Bluetooth の準備を待っています" in m for m in logs), "\n".join(logs))
+            W[0].run()
+        finally:
+            FPM.startAdvertising_ = orig
+        self.assertEqual(done, [(True, name)], "\n".join(logs))
+        self.assertEqual(len(adv), 1)
+        self.assertEqual(len(files), 1)
+
     def test_flow_with_worker_thread(self):
         """iPad の送信は、CoreBluetooth の操作を作業スレッドで行う（ble_diag_ipad.py で、iPhone が
         接続しても落ちなかった形）。iOS からの通知（メインスレッド）は値を渡すだけ。"""
@@ -750,8 +776,8 @@ class CoreBluetoothFlowTest(unittest.TestCase):
             until(lambda: snd.ready)
             W[0].on_main(snd.send, name, raw, "4")   # 画面の「送信」（メインスレッド）
             until(lambda: done)
-            snd.stop()
         finally:
+            snd.stop()   # 失敗しても作業スレッドを止める（次のテストに混ざらないように）
             tx._send = real
         self.assertEqual(done, [(True, name)], "\n".join(logs))
         with open(files[0][0], "rb") as f:

@@ -1004,6 +1004,7 @@ class BleSender(_BleBase):
             return
         self._deadline = time.time() + self.job["timeout"]
         if not self.pm or not self.ready:
+            self.job["wait_ble"] = True   # BLE の準備ができたら _do_added から始める
             self.on_log("Bluetooth の準備を待っています…")
         else:
             self._kick()
@@ -1065,7 +1066,7 @@ class BleSender(_BleBase):
             return
         self.ready = True
         self.on_log("BLE の準備ができました")
-        if self.job:
+        if self.job and self.job.pop("wait_ble", False):   # 準備の前に「送信」が押されていた
             self._kick()
 
     def _advertise(self):
