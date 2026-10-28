@@ -1,0 +1,4 @@
+ble_diag_ipad_log.txt
+ecg_ble_trace_*.txt
+__pycache__/
+ecg_ble_fault_*.txt
